@@ -65,7 +65,6 @@ export default defineConfig(({ mode }) => {
     // by replacing `process.env.VAR` with the value of the VAR
     // environment variable from the build process or your local .env file.
     define: {
-      'process.env.API_KEY': JSON.stringify(env.API_KEY),
       'process.env.OPENAI_API_KEY': JSON.stringify(env.OPENAI_API_KEY),
       'process.env.DEEPSEEK_API_KEY': JSON.stringify(env.DEEPSEEK_API_KEY),
       'process.env.ALI_API_KEY': JSON.stringify(env.ALI_API_KEY),
