@@ -15,8 +15,7 @@ permissions:
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
-# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+# Allow only one concurrent deployment
 concurrency:
   group: "pages"
   cancel-in-progress: false
@@ -36,29 +35,27 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
+          
       - name: Install dependencies
-        run: npm ci
+        # 强制删除 package-lock.json 来修复 rollup 错误
+        run: |
+          rm -f package-lock.json
+          npm install
+
       - name: Build
         run: npm run build
         env: 
-          # 1. 添加 Gemini Key
-          VITE_GEMINI_API_KEY: ${{ secrets.VITE_GEMINI_API_KEY }}
-
-          # 2. 添加你新创建的 DeepSeek Secrets
-          VITE_DEEPSEEK_API_KEY: ${{ secrets.VITE_DEEPSEEK_API_KEY }}
-          VITE_DEEPSEEK_ENDPOINT: ${{ secrets.VITE_DEEPSEEK_ENDPOINT }}
-          VITE_DEEPSEEK_MODEL: ${{ secrets.VITE_DEEPSEEK_MODEL }}
+          # --- 关键修改 ---
+          # 我们只注入你后端 API 的地址
+          # 所有的 AI API Keys 现在都安全地存在于你的 Render 后端
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
           
-          # 3. 如果你未来还要加 OpenAI, 就取消下面这几行的注释
-          VITE_OPENAI_API_KEY: ${{ secrets.VITE_OPENAI_API_KEY }}
-          VITE_OPENAI_ENDPOINT: ${{ secrets.VITE_OPENAI_ENDPOINT }}
-          VITE_OPENAI_MODEL: ${{ secrets.VITE_OPENAI_MODEL }}
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Upload the 'dist' directory which contains the built site
+          # 上传 'dist' 文件夹
           path: './dist'
       - name: Deploy to GitHub Pages
         id: deployment
