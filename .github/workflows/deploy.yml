@@ -48,7 +48,8 @@ jobs:
           # Inject the production backend API URL from repository secrets.
           # All AI API Keys should be securely stored as environment variables on your Render backend.
           VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
-          
+          # 1. 添加 Gemini Key
+          VITE_GEMINI_API_KEY: ${{ secrets.VITE_GEMINI_API_KEY }}
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
