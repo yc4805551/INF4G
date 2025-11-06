@@ -13,7 +13,7 @@ const handleStartRoaming = async () => {
 
   try {
       // Step 1: Call local backend to get relevant context - 修改top_k为3
-      const backendResponse = await fetch('/api/find-related', {
+      const backendResponse = await fetch(`${API_BASE_URL}/find-related`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

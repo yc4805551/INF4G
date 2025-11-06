@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactDOM from 'react-dom/client';
-import { Type } from "@google/genai";
 import mammoth from 'mammoth';
 import { marked } from 'marked';
+import { GoogleGenAI } from '@google/genai';
+
 
 const API_BASE_URL = import.meta.env.PROD
   ? import.meta.env.VITE_API_BASE_URL
-  : '/api';
+  : 'http://127.0.0.1:5000/api';
 
 // FIX: Modified debounce to return a function with a `clearTimeout` method to cancel pending calls.
 const debounce = <F extends (...args: any[]) => any>(func: F, waitFor: number) => {
@@ -76,6 +77,8 @@ type ChatMessage = {
   resultData?: NoteAnalysis;
 };
 
+type ExecutionMode = 'backend' | 'frontend';
+
 // State for multi-model audit results
 // FIX: Defined an interface for a single audit result to provide strong typing
 // for what was previously an anonymous object structure, resolving 'unknown' type errors.
@@ -89,45 +92,76 @@ type AuditResults = {
     [key in ModelProvider]?: AuditResult
 };
 
-const callGenerativeAi = async (provider: ModelProvider, systemInstruction: string, userPrompt: string, jsonResponse: boolean, mode: 'notes' | 'audit' | 'roaming' | 'writing' | null, history: ChatMessage[] = []) => {
-  const retries = 2; // 1 initial attempt + 2 retries
-
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const response = await fetch(`${API_BASE_URL}/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, systemInstruction, userPrompt, jsonResponse, mode, history })
-      });
-      
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => response.statusText);
-        let userFriendlyError = `后端代理服务出错 (状态码: ${response.status})。请检查后端服务日志。`;
-        if (response.status >= 500 && response.status < 600) {
-            userFriendlyError += ` 这可能是由于后端无法连接到上游AI服务导致的。`;
+const callGenerativeAi = async (
+    provider: ModelProvider,
+    executionMode: ExecutionMode,
+    systemInstruction: string,
+    userPrompt: string,
+    jsonResponse: boolean,
+    mode: 'notes' | 'audit' | 'roaming' | 'writing' | null,
+    history: ChatMessage[] = []
+) => {
+    if (executionMode === 'frontend') {
+        if (provider !== 'gemini') {
+            throw new Error('Frontend Direct mode only supports the Gemini model.');
         }
-        console.error("Backend raw error:", errorText);
-        throw new Error(userFriendlyError);
-      }
-      return await response.text();
-
-    } catch (error) {
-      console.error(`Attempt ${i + 1} failed for ${provider}:`, error);
-      if (i === retries) {
-        if (error instanceof TypeError && error.message.toLowerCase().includes('failed to fetch')) {
-             throw new Error(`网络请求失败。无法连接到后端服务(${API_BASE_URL})。请检查网络连接、VPN配置或确认后端服务正在运行。`);
+        if (!import.meta.env.VITE_GEMINI_API_KEY) {
+            throw new Error('Gemini API key is not configured for Frontend Direct mode.');
         }
-        throw error; // Re-throw the last error
-      }
-      await new Promise(res => setTimeout(res, 1000));
+
+        const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
+        const fullContents = [...history, { role: 'user', parts: [{ text: userPrompt }] }];
+
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: fullContents as any, // Cast to any to align with SDK expectations
+            config: {
+                systemInstruction: systemInstruction,
+                responseMimeType: jsonResponse ? 'application/json' : undefined
+            }
+        });
+        return response.text;
+
+    } else { // Backend mode
+        const retries = 2; // 1 initial attempt + 2 retries
+        for (let i = 0; i <= retries; i++) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider, systemInstruction, userPrompt, jsonResponse, mode, history })
+                });
+                
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => response.statusText);
+                    let userFriendlyError = `后端代理服务出错 (状态码: ${response.status})。请检查后端服务日志。`;
+                    if (response.status >= 500 && response.status < 600) {
+                        userFriendlyError += ` 这可能是由于后端无法连接到上游AI服务导致的。`;
+                    }
+                    console.error("Backend raw error:", errorText);
+                    throw new Error(userFriendlyError);
+                }
+                return await response.text();
+
+            } catch (error) {
+                console.error(`Attempt ${i + 1} failed for ${provider}:`, error);
+                if (i === retries) {
+                    if (error instanceof TypeError && error.message.toLowerCase().includes('failed to fetch')) {
+                        throw new Error(`网络请求失败。无法连接到后端服务(${API_BASE_URL})。请检查网络连接、VPN配置或确认后端服务正在运行。`);
+                    }
+                    throw error; // Re-throw the last error
+                }
+                await new Promise(res => setTimeout(res, 1000));
+            }
+        }
+        throw new Error('All retry attempts failed.');
     }
-  }
-  throw new Error('All retry attempts failed.');
 };
 
 // New function for streaming chat responses
 const callGenerativeAiStream = async (
     provider: ModelProvider,
+    executionMode: ExecutionMode,
     systemInstruction: string,
     userPrompt: string,
     history: ChatMessage[],
@@ -137,25 +171,48 @@ const callGenerativeAiStream = async (
     thinkingBudget?: number,
 ) => {
     try {
-        const response = await fetch(`${API_BASE_URL}/generate-stream`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ provider, systemInstruction, userPrompt, history, thinkingBudget })
-        });
+        if (executionMode === 'frontend') {
+             if (provider !== 'gemini') {
+                throw new Error('Frontend Direct mode only supports the Gemini model.');
+            }
+            if (!import.meta.env.VITE_GEMINI_API_KEY) {
+                throw new Error('Gemini API key is not configured for Frontend Direct mode.');
+            }
+            const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
+            const fullContents = [...history, { role: 'user', parts: [{ text: userPrompt }] }];
+            
+            const streamResult = await ai.models.generateContentStream({
+                model: 'gemini-2.5-flash',
+                contents: fullContents as any, // Cast to any to align with SDK
+                config: { systemInstruction: systemInstruction }
+            });
 
-        if (!response.ok || !response.body) {
-             const errorText = await response.text().catch(() => `Status: ${response.status}`);
-             throw new Error(`后端流式传输错误: ${errorText}`);
+            for await (const chunk of streamResult) {
+                onChunk(chunk.text);
+            }
+            onComplete();
+
+        } else { // Backend mode
+            const response = await fetch(`${API_BASE_URL}/generate-stream`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ provider, systemInstruction, userPrompt, history, thinkingBudget })
+            });
+
+            if (!response.ok || !response.body) {
+                const errorText = await response.text().catch(() => `Status: ${response.status}`);
+                throw new Error(`后端流式传输错误: ${errorText}`);
+            }
+            
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                onChunk(decoder.decode(value, { stream: true }));
+            }
+            onComplete();
         }
-        
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            onChunk(decoder.decode(value, { stream: true }));
-        }
-        onComplete();
     } catch (error: any) {
         if (error instanceof TypeError && error.message.toLowerCase().includes('failed to fetch')) {
             onError(new Error(`网络请求失败。无法连接到后端服务(${API_BASE_URL})。请检查网络连接、VPN配置或确认后端服务正在运行。`));
@@ -224,6 +281,8 @@ const HomeInputView = ({
   setSelectedKnowledgeBase,
   onKnowledgeChat,
   onWriting,
+  executionMode,
+  setExecutionMode,
 }: {
   inputText: string;
   setInputText: React.Dispatch<React.SetStateAction<string>>;
@@ -239,6 +298,8 @@ const HomeInputView = ({
   setSelectedKnowledgeBase: (id: string) => void;
   onKnowledgeChat: () => void;
   onWriting: () => void;
+  executionMode: ExecutionMode;
+  setExecutionMode: (mode: ExecutionMode) => void;
 }) => {
     const lastPastedText = useRef('');
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -366,6 +427,28 @@ const HomeInputView = ({
             </div>
             <div className="home-panel">
                 <h2>全局配置</h2>
+                 <div className="config-group">
+                    <h4>执行模式</h4>
+                    <div className="model-selector-group">
+                        <button
+                            className={`model-btn ${executionMode === 'backend' ? 'active' : ''}`}
+                            onClick={() => setExecutionMode('backend')}
+                            disabled={isProcessing}
+                        >
+                            后端代理
+                        </button>
+                        <button
+                            className={`model-btn ${executionMode === 'frontend' ? 'active' : ''}`}
+                            onClick={() => setExecutionMode('frontend')}
+                            disabled={isProcessing}
+                        >
+                            前端直连
+                        </button>
+                    </div>
+                    {executionMode === 'frontend' && (
+                        <p className="instruction-text">前端直连模式仅支持 Gemini 模型，并将直接在浏览器中调用其 API。</p>
+                    )}
+                </div>
                 <div className="config-group">
                     <h4>选择模型</h4>
                     <div className="model-selector-group">
@@ -374,7 +457,7 @@ const HomeInputView = ({
                                 key={model}
                                 className={`model-btn ${selectedModel === model ? 'active' : ''}`}
                                 onClick={() => setSelectedModel(model)}
-                                disabled={isProcessing}
+                                disabled={isProcessing || (executionMode === 'frontend' && model !== 'gemini')}
                             >
                                 {model}
                             </button>
@@ -436,7 +519,8 @@ const NoteAnalysisView = ({
   provider,
   originalText,
   selectedKnowledgeBaseId,
-  knowledgeBases
+  knowledgeBases,
+  executionMode,
 }: {
   analysisResult: NoteAnalysis | null;
   isLoading: boolean;
@@ -445,6 +529,7 @@ const NoteAnalysisView = ({
   originalText: string;
   selectedKnowledgeBaseId: string | null;
   knowledgeBases: { id: string; name: string }[];
+  executionMode: ExecutionMode;
 }) => {
   const [consolidatedText, setConsolidatedText] = useState('');
   
@@ -583,7 +668,7 @@ const NoteAnalysisView = ({
         
         const roamingPromises = sources.map(async (source: Source) => {
             const userPrompt = `[Relevant Passage from Knowledge Base]:\n${source.content_chunk}\n\n[User's Original Note]:\n${analysisResult.organizedText}`;
-            const genAiResponseText = await callGenerativeAi(provider, systemInstruction, userPrompt, true, 'roaming');
+            const genAiResponseText = await callGenerativeAi(provider, executionMode, systemInstruction, userPrompt, true, 'roaming');
             const result = JSON.parse(genAiResponseText.replace(/```json\n?|\n?```/g, ''));
 
             if (!result.conclusion) {
@@ -630,6 +715,7 @@ const NoteAnalysisView = ({
       try {
           await callGenerativeAiStream(
               provider,
+              executionMode,
               systemInstruction,
               chatInput,
               chatHistoryForApi,
@@ -837,10 +923,12 @@ const parseAuditResponse = (responseText: string): { issues: AuditIssue[], error
 
 const AuditView = ({
     initialText,
-    selectedModel
+    selectedModel,
+    executionMode,
 } : {
     initialText: string;
     selectedModel: ModelProvider;
+    executionMode: ExecutionMode;
 }) => {
     const [text] = useState(initialText);
     const [auditResults, setAuditResults] = useState<AuditResults>({});
@@ -886,7 +974,7 @@ const AuditView = ({
         const userPrompt = `[Text to Audit]:\n\n${text}`;
         
         try {
-            const responseText = await callGenerativeAi(model, systemInstruction, userPrompt, true, 'audit');
+            const responseText = await callGenerativeAi(model, executionMode, systemInstruction, userPrompt, true, 'audit');
             const { issues, error, rawResponse } = parseAuditResponse(responseText);
             setAuditResults({ [model]: { issues, error, rawResponse } });
             
@@ -913,7 +1001,7 @@ const AuditView = ({
         const userPrompt = `[Text to Audit]:\n\n${text}`;
 
         const auditPromises = allModels.map(model => 
-            callGenerativeAi(model, systemInstruction, userPrompt, true, 'audit')
+            callGenerativeAi(model, executionMode, systemInstruction, userPrompt, true, 'audit')
         );
         
         const results = await Promise.allSettled(auditPromises);
@@ -1004,11 +1092,11 @@ const AuditView = ({
                     <button className="btn btn-secondary" onClick={addChecklistItem} disabled={isLoading}>+ 添加规则</button>
                 </div>
                 <div className="audit-button-group">
-                     <button className="btn btn-primary audit-start-btn" onClick={handleAudit} disabled={isLoading || !text}>
+                     <button className="btn btn-primary audit-start-btn" onClick={handleAudit} disabled={isLoading || !text || (executionMode === 'frontend' && selectedModel !== 'gemini')}>
                         {isLoading ? <span className="spinner"></span> : null}
                         {isLoading ? '审阅中...' : `审阅 (${selectedModel})`}
                     </button>
-                    <button className="btn btn-primary audit-start-btn" onClick={handleAuditAll} disabled={isLoading || !text}>
+                    <button className="btn btn-primary audit-start-btn" onClick={handleAuditAll} disabled={isLoading || !text || executionMode === 'frontend'}>
                         {isLoading ? <span className="spinner"></span> : null}
                         {isLoading ? '审阅中...' : '全部模型审阅'}
                     </button>
@@ -1117,11 +1205,13 @@ const KnowledgeChatView = ({
   knowledgeBaseName,
   initialQuestion,
   provider,
+  executionMode,
 }: {
   knowledgeBaseId: string;
   knowledgeBaseName: string;
   initialQuestion?: string;
   provider: ModelProvider;
+  executionMode: ExecutionMode;
 }) => {
   const [chatHistory, setChatHistory] = useState<NoteChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
@@ -1230,7 +1320,7 @@ const KnowledgeChatView = ({
       const chatHistoryForApi: ChatMessage[] = []; // No history is passed for KB-mode to force focus on provided context
 
       await callGenerativeAiStream(
-          provider, systemInstruction, userPrompt, chatHistoryForApi,
+          provider, executionMode, systemInstruction, userPrompt, chatHistoryForApi,
           (chunk) => {
               setChatHistory(prev => {
                   const newHistory = [...prev];
@@ -1269,7 +1359,7 @@ const KnowledgeChatView = ({
         });
         setIsChatLoading(false);
     }
-  }, [chatInput, isChatLoading, knowledgeBaseId, provider]);
+  }, [chatInput, isChatLoading, knowledgeBaseId, provider, executionMode]);
 
   useEffect(() => {
     if (initialQuestion && !isInitialQuestionSent.current) {
@@ -1419,12 +1509,14 @@ const WritingView = ({
   selectedModel,
   selectedKnowledgeBase,
   knowledgeBases,
+  executionMode,
 }: {
   initialText: string;
   onTextChange: (newText: string) => void;
   selectedModel: ModelProvider;
   selectedKnowledgeBase: string | null;
   knowledgeBases: { id: string; name: string }[];
+  executionMode: ExecutionMode;
 }) => {
   const [text, setText] = useState(initialText);
   const [suggestions, setSuggestions] = useState<WritingSuggestion[]>([]);
@@ -1474,7 +1566,7 @@ ${styleText.trim()}
     const userPrompt = `[Text for Analysis]:\n\n${currentText}`;
 
     try {
-      const responseText = await callGenerativeAi(selectedModel, systemInstruction, userPrompt, true, 'writing');
+      const responseText = await callGenerativeAi(selectedModel, executionMode, systemInstruction, userPrompt, true, 'writing');
       
       // If another request has started, ignore the result of this one to prevent race conditions.
       if (fetchId !== fetchIdRef.current) return;
@@ -1499,7 +1591,7 @@ ${styleText.trim()}
           setIsLoading(false);
       }
     }
-  }, 1500), [selectedModel]);
+  }, 1500), [selectedModel, executionMode]);
 
   useEffect(() => {
     onTextChange(text);
@@ -1755,6 +1847,7 @@ const App = () => {
     const [isThoughtsModalOpen, setIsThoughtsModalOpen] = useState(false);
     
     const [selectedModel, setSelectedModel] = useState<ModelProvider>('gemini');
+    const [executionMode, setExecutionMode] = useState<ExecutionMode>('backend');
 
     const [knowledgeBases, setKnowledgeBases] = useState<{ id: string; name: string }[]>([]);
     const [isKbLoading, setIsKbLoading] = useState(true);
@@ -1762,6 +1855,12 @@ const App = () => {
     const [selectedKnowledgeBase, setSelectedKnowledgeBase] = useState<string | null>(null);
     const [initialKnowledgeChatQuestion, setInitialKnowledgeChatQuestion] = useState<string | undefined>();
     
+    useEffect(() => {
+        if (executionMode === 'frontend') {
+            setSelectedModel('gemini');
+        }
+    }, [executionMode]);
+
     useEffect(() => {
         const fetchKnowledgeBases = async () => {
             setIsKbLoading(true);
@@ -1810,7 +1909,7 @@ const App = () => {
         const userPrompt = `Here are my notes:\n\n${inputText}\n\nHere are my thoughts on these notes:\n\n${userThoughts}`;
 
         try {
-            const responseText = await callGenerativeAi(selectedModel, systemInstruction, userPrompt, true, 'notes');
+            const responseText = await callGenerativeAi(selectedModel, executionMode, systemInstruction, userPrompt, true, 'notes');
             let result;
             try {
                 result = JSON.parse(responseText);
@@ -1871,9 +1970,14 @@ const App = () => {
                     originalText={inputText}
                     selectedKnowledgeBaseId={selectedKnowledgeBase}
                     knowledgeBases={knowledgeBases}
+                    executionMode={executionMode}
                 />;
             case 'audit':
-                 return <AuditView initialText={inputText} selectedModel={selectedModel} />;
+                 return <AuditView 
+                    initialText={inputText} 
+                    selectedModel={selectedModel}
+                    executionMode={executionMode}
+                 />;
             case 'knowledge-chat':
                 if (!selectedKnowledgeBase) {
                     return <div className="error-message">错误：知识库未选择。请返回首页选择一个知识库。</div>;
@@ -1883,6 +1987,7 @@ const App = () => {
                     knowledgeBaseName={knowledgeBases.find(kb => kb.id === selectedKnowledgeBase)?.name || selectedKnowledgeBase}
                     initialQuestion={initialKnowledgeChatQuestion}
                     provider={selectedModel}
+                    executionMode={executionMode}
                 />;
             case 'writing':
                 return <WritingView
@@ -1891,6 +1996,7 @@ const App = () => {
                     selectedModel={selectedModel}
                     selectedKnowledgeBase={selectedKnowledgeBase}
                     knowledgeBases={knowledgeBases}
+                    executionMode={executionMode}
                 />;
             case 'home':
             default:
@@ -1910,6 +2016,8 @@ const App = () => {
                         setSelectedKnowledgeBase={setSelectedKnowledgeBase}
                         onKnowledgeChat={handleTriggerKnowledgeChat}
                         onWriting={handleTriggerWriting}
+                        executionMode={executionMode}
+                        setExecutionMode={setExecutionMode}
                     />
                 );
         }

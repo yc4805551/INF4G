@@ -1,22 +1,23 @@
 # app.py
 #
-# 知识库后端服务器 (Flask + Milvus + Ollama) - v13 (最终稳定版)
+# 知识库后端 + AI 代理服务器 (Flask + Milvus + Ollama + Cloud APIs)
 #
 # 描述:
-# 这个版本是项目的最终稳定版，解决了 'collection not loaded' 的错误，
-# 并统一了数据模型，确保所有操作（创建、更新、查询）都严格遵循
-# 旧知识库的 Schema，实现了完全的向后兼容。
+# 此版本合并了两个功能：
+# 1. 知识库后端 (Milvus + Ollama 嵌入)
+# 2. AI 代理 (代理对 Gemini, OpenAI, Deepseek, Ali 的调用)
 
 import os
 import click
 import requests
 import uuid
 import time
+import json # 新增
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context # 新增 Response, stream_with_context
 from flask_cors import CORS
 from pymilvus import connections, utility, Collection, CollectionSchema, FieldSchema, DataType
 from dotenv import load_dotenv
@@ -35,6 +36,29 @@ KNOWLEDGE_BASE_DIR_NOMIC = os.getenv("KNOWLEDGE_BASE_DIR_NOMIC", "./knowledge_ba
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 50))
 INGEST_WORKERS = int(os.getenv("INGEST_WORKERS", 8))
+
+# --- [新增] AI 代理的配置 ---
+# 使用代理API而非官方API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# OpenAI 代理配置
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "dummy-key-for-proxy")
+OPENAI_PROXY_PATH = os.getenv("OPENAI_PROXY_PATH", "/proxy/my-openai")
+OPENAI_TARGET_URL = os.getenv("OPENAI_TARGET_URL", "https://api.chatanywhere.tech")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+
+# DeepSeek 代理配置
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "dummy-key-for-proxy")
+DEEPSEEK_PROXY_PATH = os.getenv("DEEPSEEK_PROXY_PATH", "/proxy/deepseek")
+DEEPSEEK_TARGET_URL = os.getenv("DEEPSEEK_TARGET_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_ENDPOINT = os.getenv("DEEPSEEK_ENDPOINT", "https://api.deepseek.com/v1/chat/completions")
+
+# Ali (Doubao) 代理配置
+ALI_API_KEY = os.getenv("ALI_API_KEY", "dummy-key-for-proxy")
+ALI_PROXY_PATH = os.getenv("ALI_PROXY_PATH", "/proxy/ali")
+ALI_TARGET_URL = os.getenv("ALI_TARGET_URL", "https://www.dmxapi.cn")
+ALI_MODEL = os.getenv("ALI_MODEL", "doubao-seed-1-6-250615")
 
 # --- 模型映射配置 ---
 MODEL_MAPPING = {
@@ -60,7 +84,7 @@ try:
 except Exception as e:
     logging.error(f"连接 Milvus 失败: {e}")
 
-# --- 辅助函数 ---
+# --- 辅助函数 (知识库部分) ---
 def get_model_for_collection(collection_name: str) -> str:
     for key, model_name in MODEL_MAPPING.items():
         if key in collection_name:
@@ -116,22 +140,13 @@ def text_to_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 # --- [核心修正] 统一数据处理逻辑 ---
 def upsert_file_to_milvus(file_path: str, collection_name: str, model_name: str):
-    """
-    一个通用的函数，负责处理单个文件的读取、切块、生成嵌入和插入/更新到Milvus。
-    在所有操作前加载集合，并严格按照旧 Schema 准备数据。
-    """
     filename = os.path.basename(file_path)
-    
     try:
         collection = Collection(collection_name)
-        collection.load() # <-- [修复] 确保集合已加载
-        
-        # 1. 删除旧数据
+        collection.load()
         delete_expr = f"source_file == '{filename}'"
         collection.delete(delete_expr)
         logging.info(f"已从 '{collection_name}' 中删除 '{filename}' 的旧条目。")
-
-        # 2. 准备新数据
         with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
         chunks = text_to_chunks(content)
         if not chunks: 
@@ -146,8 +161,6 @@ def upsert_file_to_milvus(file_path: str, collection_name: str, model_name: str)
                 try:
                     embedding = future.result()
                     i, chunk = future_to_chunk[future]
-                    
-                    # 严格按照旧 Schema 构建实体
                     entity = {
                         "id": str(uuid.uuid4()),
                         "text": chunk,
@@ -159,17 +172,13 @@ def upsert_file_to_milvus(file_path: str, collection_name: str, model_name: str)
                     entities_to_insert.append(entity)
                 except Exception as e:
                     logging.error(f"为 '{filename}' 的一个文本块生成嵌入时失败: {e}")
-
-        # 3. 批量插入
         if entities_to_insert:
             collection.insert(entities_to_insert)
             collection.flush()
             logging.info(f"成功为 '{filename}' 插入 {len(entities_to_insert)} 个新条目。")
-            
     except Exception as e:
         logging.error(f"处理文件 '{filename}' 时发生严重错误: {e}")
     finally:
-        # 确保操作完成后释放集合资源
         if 'collection' in locals():
             collection.release()
 
@@ -178,7 +187,7 @@ def process_file_delete(file_path, collection_name):
     logging.info(f"检测到文件删除: {filename}")
     try:
         collection = Collection(collection_name)
-        collection.load() # <-- [修复] 确保集合已加载
+        collection.load()
         delete_expr = f"source_file == '{filename}'"
         collection.delete(delete_expr)
         logging.info(f"已从 '{collection_name}' 中删除 '{filename}' 的所有相关条目。")
@@ -196,15 +205,10 @@ class KnowledgeBaseEventHandler(FileSystemEventHandler):
         self.base_dir = base_dir or KNOWLEDGE_BASE_DIR
         self.watch_path = os.path.normpath(os.path.join(self.base_dir, self.collection_to_watch))
         logging.info(f"监控器已初始化，目标路径: {self.watch_path}")
-
     def process_if_relevant(self, event):
-        if event.is_directory or not (event.src_path.endswith(".txt") or event.src_path.endswith(".md")):
-            return
-        
+        if event.is_directory or not (event.src_path.endswith(".txt") or event.src_path.endswith(".md")): return
         event_dir = os.path.normpath(os.path.dirname(event.src_path))
-        if event_dir != self.watch_path:
-            return
-
+        if event_dir != self.watch_path: return
         if event.event_type in ('created', 'modified'):
             upsert_file_to_milvus(event.src_path, self.collection_to_watch, self.model_name)
         elif event.event_type == 'deleted':
@@ -214,7 +218,6 @@ class KnowledgeBaseEventHandler(FileSystemEventHandler):
             dest_dir = os.path.normpath(os.path.dirname(event.dest_path))
             if dest_dir == self.watch_path:
                 upsert_file_to_milvus(event.dest_path, self.collection_to_watch, self.model_name)
-
     def on_created(self, event): self.process_if_relevant(event)
     def on_modified(self, event): self.process_if_relevant(event)
     def on_deleted(self, event): self.process_if_relevant(event)
@@ -226,14 +229,11 @@ def ingest_data():
     if not os.path.exists(KNOWLEDGE_BASE_DIR) or not os.path.isdir(KNOWLEDGE_BASE_DIR):
         logging.error(f"知识库根目录 '{KNOWLEDGE_BASE_DIR}' 不存在或不是一个目录。")
         return
-
     for collection_name in os.listdir(KNOWLEDGE_BASE_DIR):
         collection_path = os.path.join(KNOWLEDGE_BASE_DIR, collection_name)
         if not os.path.isdir(collection_path): continue
-
         logging.info(f"\n--- 正在处理目录 (集合): {collection_name} ---")
         model_to_use = get_model_for_collection(collection_name)
-        
         try:
             logging.info(f"正在检测模型 '{model_to_use}' 的向量维度...")
             dummy_embedding = get_ollama_embedding("test", model_to_use)
@@ -242,9 +242,7 @@ def ingest_data():
         except Exception as e:
             logging.error(f"无法为模型 '{model_to_use}' 获取向量维度，跳过此目录。错误: {e}")
             continue
-
         create_milvus_collection(collection_name, dim)
-
         for filename in os.listdir(collection_path):
             file_path = os.path.join(collection_path, filename)
             if not (filename.endswith(".txt") or filename.endswith(".md")): continue
@@ -256,66 +254,54 @@ def ingest_data():
 def ingest_command():
     ingest_data()
     click.echo("数据导入过程完成。")
-
 @app.cli.command("watch")
 def watch_command():
     collection_to_watch = 'kb_qwen_0_6b'
     model_name = get_model_for_collection(collection_to_watch)
-    
     if not utility.has_collection(collection_to_watch):
         click.echo(f"错误: 目标知识库 '{collection_to_watch}' 在 Milvus 中不存在。")
         click.echo(f"请先运行 'flask ingest' 来创建和初始化所有知识库。")
         return
-
     path_to_watch = KNOWLEDGE_BASE_DIR
     event_handler = KnowledgeBaseEventHandler(collection_to_watch, model_name)
     observer = Observer()
     observer.schedule(event_handler, path_to_watch, recursive=True)
-    
     click.echo(f"✅ 已启动监控服务，只处理对 '{collection_to_watch}' 知识库的更新。")
     click.echo(f"   监控目录: {os.path.join(path_to_watch, collection_to_watch)}")
     click.echo("   按 Ctrl+C 停止服务。")
-    
     observer.start()
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
     click.echo("\n监控服务已停止。")
-
 @app.cli.command("watch-nomic")
 def watch_nomic_command():
     collection_to_watch = 'kb_nomic'
     model_name = get_model_for_collection(collection_to_watch)
-    
     if not utility.has_collection(collection_to_watch):
         click.echo(f"错误: 目标知识库 '{collection_to_watch}' 在 Milvus 中不存在。")
         click.echo(f"请先运行 'flask ingest' 来创建和初始化所有知识库。")
         return
-
     path_to_watch = KNOWLEDGE_BASE_DIR_NOMIC
     event_handler = KnowledgeBaseEventHandler(collection_to_watch, model_name, base_dir=KNOWLEDGE_BASE_DIR_NOMIC)
     observer = Observer()
     observer.schedule(event_handler, path_to_watch, recursive=True)
-    
     click.echo(f"✅ 已启动监控服务，只处理对 '{collection_to_watch}' 知识库的更新。")
     click.echo(f"   监控目录: {os.path.join(path_to_watch, collection_to_watch)}")
     click.echo("   按 Ctrl+C 停止服务。")
-    
     observer.start()
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
     click.echo("\n监控服务已停止。")
 
 
-# --- API 端点 ---
-@app.route('/list-collections', methods=['GET'])
+# --- 知识库 API 端点 ---
+@app.route('/api/list-collections', methods=['GET'])
 def list_collections():
     try:
         collections = utility.list_collections()
@@ -324,32 +310,25 @@ def list_collections():
         logging.error(f"API /list-collections 失败: {e}")
         return jsonify({"error": "无法获取 Milvus 集合列表", "details": str(e)}), 500
 
-@app.route('/find-related', methods=['POST'])
+@app.route('/api/find-related', methods=['POST'])
 def find_related():
     try:
         data = request.get_json()
         query_text = data.get('text')
         collection_name = data.get('collection_name')
         top_k = data.get('top_k', 10)
-
         if not query_text or not collection_name:
             return jsonify({"error": "请求中缺少 'text' 或 'collection_name'"}), 400
-        
         if not utility.has_collection(collection_name):
             return jsonify({"error": f"知识库 (集合) '{collection_name}' 不存在。"}), 404
-
         model_to_use = get_model_for_collection(collection_name)
         query_embedding = get_ollama_embedding(query_text, model_to_use)
-        
         collection = Collection(collection_name)
         collection.load()
         schema_fields = {field.name: field for field in collection.schema.fields}
-        
         output_fields = ["text", "source_file", "chunk_index", "full_path"]
-        
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
         results = collection.search(data=[query_embedding], anns_field="embedding", param=search_params, limit=top_k, output_fields=output_fields)
-
         response_data = []
         for hit in results[0]:
             entity = hit.entity
@@ -358,20 +337,458 @@ def find_related():
                 "content_chunk": entity.get("text", ""),
                 "score": hit.distance,
             })
-
         collection.release()
         return jsonify({"related_documents": response_data})
-
     except (RuntimeError, ValueError) as e:
         return jsonify({"error": str(e)}), 503
     except Exception as e:
         logging.error(f"API /find-related 发生内部错误: {e}", exc_info=True)
         return jsonify({"error": "服务器内部错误", "details": str(e)}), 500
 
-@app.route('/', methods=['GET'])
+@app.route('/api/', methods=['GET'])
 def index():
-    return "知识库后端服务器正在运行 (Ollama + Milvus) v13。"
+    return "知识库后端 + AI 代理服务器正在运行 (v13 + 代理)。"
+
+
+# --- [新增] AI 代理端点 ---
+
+def _format_history(history):
+    """辅助函数：格式化历史记录"""
+    # (这里您可以根据不同模型的需要调整格式)
+    return history
+
+@app.route('/api/generate', methods=['POST'])
+def handle_generate():
+    """处理非流式 AI 生成请求"""
+    try:
+        data = request.get_json()
+        provider = data.get('provider')
+        
+        logging.info(f"收到非流式生成请求，Provider: {provider}")
+        
+        # 统一调用流式函数，但等待完整响应
+        if provider == 'gemini':
+            if not GEMINI_API_KEY:
+                return jsonify({"error": "GEMINI_API_KEY 未设置"}), 500
+            # Gemini 仍然使用官方API
+            import io
+            from contextlib import redirect_stdout
+            f = io.StringIO()
+            with redirect_stdout(f):
+                for chunk in _stream_gemini(data.get('userPrompt'), data.get('systemInstruction'), data.get('history', [])):
+                    print(chunk, end='')
+            full_response = f.getvalue()
+            return jsonify({"text": full_response})
+        elif provider == 'openai':
+            # 使用代理的OpenAI
+            return _call_openai_proxy(data)
+        elif provider == 'deepseek':
+            # 使用代理的Deepseek
+            return _call_deepseek_proxy(data)
+        elif provider == 'ali':
+            # 使用代理的Ali
+            return _call_ali_proxy(data)
+        else:
+            return jsonify({"error": f"不支持的 provider: {provider}"}), 400
+
+    except Exception as e:
+        logging.error(f"API /api/generate 错误: {e}")
+        return jsonify({"error": "服务器内部错误", "details": str(e)}), 500
+
+
+@app.route('/api/generate-stream', methods=['POST'])
+def handle_generate_stream():
+    """处理流式 AI 生成请求"""
+    try:
+        data = request.get_json()
+        provider = data.get('provider')
+        system_instruction = data.get('systemInstruction')
+        user_prompt = data.get('userPrompt')
+        history = _format_history(data.get('history', []))
+        
+        logging.info(f"收到 /api/generate-stream 请求，Provider: {provider}")
+
+        if provider == 'gemini':
+            if not GEMINI_API_KEY:
+                return jsonify({"error": "GEMINI_API_KEY 未设置"}), 500
+            return Response(stream_with_context(_stream_gemini(user_prompt, system_instruction, history)), content_type='text/plain')
+        
+        elif provider == 'openai':
+            # 使用代理的OpenAI流式调用
+            return Response(stream_with_context(_stream_openai_proxy(user_prompt, system_instruction, history)), content_type='text/plain')
+            
+        elif provider == 'deepseek':
+            # 使用代理的Deepseek流式调用
+            return Response(stream_with_context(_stream_deepseek_proxy(user_prompt, system_instruction, history)), content_type='text/plain')
+            
+        elif provider == 'ali':
+            # 使用代理的Ali流式调用
+            return Response(stream_with_context(_stream_ali_proxy(user_prompt, system_instruction, history)), content_type='text/plain')
+
+        else:
+            return jsonify({"error": f"不支持的 provider: {provider}"}), 400
+
+    except Exception as e:
+        logging.error(f"API /api/generate-stream 错误: {e}")
+        return jsonify({"error": "服务器内部错误", "details": str(e)}), 500
+
+def _stream_gemini(user_prompt, system_instruction, history):
+    """流式调用 Google Gemini"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?key={GEMINI_API_KEY}"
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    # 构建 Gemini 的 contents 格式
+    contents = []
+    if system_instruction:
+        # Gemini 没有 system, 放在第一个 user message
+        contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+        contents.append({"role": "model", "parts": [{"text": "好的，我将遵循这个指示。"}]}) # 模拟 assistant 回答
+
+    for item in history:
+        # 确保 "user" 和 "model" 角色
+        if item['role'] == 'user':
+             contents.append({"role": "user", "parts": [{"text": item['parts'][0]['text']}]})
+        elif item['role'] == 'model':
+             contents.append({"role": "model", "parts": [{"text": item['parts'][0]['text']}]})
+
+    contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+
+    payload = {"contents": contents}
+
+    try:
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8').strip()
+                    if line_str.startswith('"text":'):
+                        text_chunk = line_str.replace('"text": "', '').replace('"', '').replace(',', '').strip()
+                        yield text_chunk
+    except requests.exceptions.RequestException as e:
+        logging.error(f"调用 Gemini API 失败: {e}")
+        yield f"[后端代理错误: {str(e)}]"
+    except Exception as e:
+        logging.error(f"处理 Gemini 流时出错: {e}")
+        yield f"[后端内部错误: {str(e)}]"
+
+
+# --- 代理 API 调用函数 ---
+
+def _call_openai_proxy(data):
+    """调用代理的 OpenAI API"""
+    try:
+        url = f"{OPENAI_TARGET_URL}/v1/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {OPENAI_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if data.get('systemInstruction'):
+            messages.append({"role": "system", "content": data.get('systemInstruction')})
+        
+        # 添加历史消息
+        for item in data.get('history', []):
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": data.get('userPrompt')})
+        
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0.7
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response.raise_for_status()
+        response_data = response.json()
+        
+        if 'choices' in response_data and len(response_data['choices']) > 0:
+            return jsonify({"text": response_data['choices'][0]['message']['content']})
+        else:
+            raise ValueError("Invalid response format from OpenAI proxy")
+    
+    except Exception as e:
+        logging.error(f"调用 OpenAI 代理失败: {e}")
+        raise
+
+def _stream_openai_proxy(user_prompt, system_instruction, history):
+    """流式调用代理的 OpenAI API"""
+    try:
+        url = f"{OPENAI_TARGET_URL}/v1/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {OPENAI_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        
+        # 添加历史消息
+        for item in history:
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": user_prompt})
+        
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True
+        }
+        
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8').strip()
+                    if line_str.startswith('data: '):
+                        line_str = line_str[6:]
+                        if line_str == '[DONE]':
+                            break
+                        try:
+                            chunk_data = json.loads(line_str)
+                            if ('choices' in chunk_data and 
+                                len(chunk_data['choices']) > 0 and
+                                chunk_data['choices'][0].get('delta') and
+                                'content' in chunk_data['choices'][0]['delta']):
+                                content = chunk_data['choices'][0]['delta']['content']
+                                yield content
+                        except json.JSONDecodeError:
+                            logging.warning(f"无法解析 OpenAI 流式响应: {line_str}")
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"调用 OpenAI 代理失败: {e}")
+        yield f"[后端代理错误: {str(e)}]"
+    except Exception as e:
+        logging.error(f"处理 OpenAI 流时出错: {e}")
+        yield f"[后端内部错误: {str(e)}]"
+
+def _call_deepseek_proxy(data):
+    """调用代理的 DeepSeek API"""
+    try:
+        url = DEEPSEEK_ENDPOINT
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {DEEPSEEK_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if data.get('systemInstruction'):
+            messages.append({"role": "system", "content": data.get('systemInstruction')})
+        
+        # 添加历史消息
+        for item in data.get('history', []):
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": data.get('userPrompt')})
+        
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": 0.7
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response.raise_for_status()
+        response_data = response.json()
+        
+        if 'choices' in response_data and len(response_data['choices']) > 0:
+            return jsonify({"text": response_data['choices'][0]['message']['content']})
+        else:
+            raise ValueError("Invalid response format from DeepSeek proxy")
+    
+    except Exception as e:
+        logging.error(f"调用 DeepSeek 代理失败: {e}")
+        raise
+
+def _stream_deepseek_proxy(user_prompt, system_instruction, history):
+    """流式调用代理的 DeepSeek API"""
+    try:
+        url = DEEPSEEK_ENDPOINT
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {DEEPSEEK_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        
+        # 添加历史消息
+        for item in history:
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": user_prompt})
+        
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True
+        }
+        
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8').strip()
+                    if line_str.startswith('data: '):
+                        line_str = line_str[6:]
+                        if line_str == '[DONE]':
+                            break
+                        try:
+                            chunk_data = json.loads(line_str)
+                            if ('choices' in chunk_data and 
+                                len(chunk_data['choices']) > 0 and
+                                chunk_data['choices'][0].get('delta') and
+                                'content' in chunk_data['choices'][0]['delta']):
+                                content = chunk_data['choices'][0]['delta']['content']
+                                yield content
+                        except json.JSONDecodeError:
+                            logging.warning(f"无法解析 DeepSeek 流式响应: {line_str}")
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"调用 DeepSeek 代理失败: {e}")
+        yield f"[后端代理错误: {str(e)}]"
+    except Exception as e:
+        logging.error(f"处理 DeepSeek 流时出错: {e}")
+        yield f"[后端内部错误: {str(e)}]"
+
+def _call_ali_proxy(data):
+    """调用代理的 Ali (Doubao) API"""
+    try:
+        # 阿里云通义千问的 API 格式可能有所不同
+        url = f"{ALI_TARGET_URL}/v1/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {ALI_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if data.get('systemInstruction'):
+            messages.append({"role": "system", "content": data.get('systemInstruction')})
+        
+        # 添加历史消息
+        for item in data.get('history', []):
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": data.get('userPrompt')})
+        
+        payload = {
+            "model": ALI_MODEL,
+            "messages": messages,
+            "temperature": 0.7
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response.raise_for_status()
+        response_data = response.json()
+        
+        if 'choices' in response_data and len(response_data['choices']) > 0:
+            return jsonify({"text": response_data['choices'][0]['message']['content']})
+        else:
+            raise ValueError("Invalid response format from Ali proxy")
+    
+    except Exception as e:
+        logging.error(f"调用 Ali 代理失败: {e}")
+        raise
+
+def _stream_ali_proxy(user_prompt, system_instruction, history):
+    """流式调用代理的 Ali (Doubao) API"""
+    try:
+        # 阿里云通义千问的 API 格式可能有所不同
+        url = f"{ALI_TARGET_URL}/v1/chat/completions"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {ALI_API_KEY}'
+        }
+        
+        # 构建请求体
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        
+        # 添加历史消息
+        for item in history:
+            if item.get('role') and item.get('parts') and len(item.get('parts')) > 0:
+                messages.append({
+                    "role": item.get('role'),
+                    "content": item.get('parts')[0].get('text')
+                })
+        
+        # 添加用户消息
+        messages.append({"role": "user", "content": user_prompt})
+        
+        payload = {
+            "model": ALI_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True
+        }
+        
+        with requests.post(url, headers=headers, json=payload, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8').strip()
+                    if line_str.startswith('data: '):
+                        line_str = line_str[6:]
+                        if line_str == '[DONE]':
+                            break
+                        try:
+                            chunk_data = json.loads(line_str)
+                            if ('choices' in chunk_data and 
+                                len(chunk_data['choices']) > 0 and
+                                chunk_data['choices'][0].get('delta') and
+                                'content' in chunk_data['choices'][0]['delta']):
+                                content = chunk_data['choices'][0]['delta']['content']
+                                yield content
+                        except json.JSONDecodeError:
+                            logging.warning(f"无法解析 Ali 流式响应: {line_str}")
+    
+    except requests.exceptions.RequestException as e:
+        logging.error(f"调用 Ali 代理失败: {e}")
+        yield f"[后端代理错误: {str(e)}]"
+    except Exception as e:
+        logging.error(f"处理 Ali 流时出错: {e}")
+        yield f"[后端内部错误: {str(e)}]"
+
 
 if __name__ == '__main__':
+    # 注意: 环境变量 FLASK_APP=app.py
+    # 运行: flask run --port=5000
+    # (或在生产环境中使用 gunicorn)
     app.run(debug=True, port=5000)
-
