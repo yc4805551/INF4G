@@ -455,7 +455,7 @@ def _stream_gemini(user_prompt, system_instruction, history):
         contents.append({"role": "user", "parts": [{"text": user_prompt}]}) 
         
         # 4. 构建API请求 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?key={GEMINI_API_KEY}" 
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?key={GEMINI_API_KEY}" 
         headers = {'Content-Type': 'application/json'} 
         payload = { 
             "contents": contents, 
