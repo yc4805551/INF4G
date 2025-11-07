@@ -312,7 +312,17 @@ def watch_nomic_command():
 @app.route('/api/list-collections', methods=['GET'])
 def list_collections():
     try:
-        collections = utility.list_collections()
+        # 检查并重新建立Milvus连接
+        try:
+            # 尝试获取集合列表，如果失败则重新连接
+            collections = utility.list_collections()
+        except Exception as conn_error:
+            logging.warning(f"Milvus连接可能已断开，尝试重新连接: {conn_error}")
+            # 重新建立连接
+            connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+            collections = utility.list_collections()
+            logging.info("Milvus连接已重新建立")
+        
         return jsonify({"collections": collections})
     except Exception as e:
         logging.error(f"API /list-collections 失败: {e}")
@@ -455,7 +465,7 @@ def _stream_gemini(user_prompt, system_instruction, history):
         contents.append({"role": "user", "parts": [{"text": user_prompt}]}) 
         
         # 4. 构建API请求 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?key={GEMINI_API_KEY}" 
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key={GEMINI_API_KEY}" 
         headers = {'Content-Type': 'application/json'} 
         payload = { 
             "contents": contents, 
@@ -467,8 +477,9 @@ def _stream_gemini(user_prompt, system_instruction, history):
         } 
         
         # 如果有系统指令，添加到payload (1.5-flash 使用 systemInstruction) 
-        if system_instruction: 
-            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]} 
+        # 注释掉systemInstruction字段，因为gemini-pro模型不支持此字段
+        # if system_instruction: 
+        #     payload["systemInstruction"] = {"parts": [{"text": system_instruction}]} 
         
         # 5. 发送API请求 
         logging.info(f"发送到 Gemini 的 Payload (精简版): {len(contents)} 条消息。") 
@@ -831,8 +842,21 @@ if __name__ == '__main__':
             top_k = data.get('top_k', 10)
             if not query_text or not collection_name:
                 return jsonify({"error": "请求中缺少 'text' 或 'collection_name'"}), 400
-            if not utility.has_collection(collection_name):
-                return jsonify({"error": f"知识库 (集合) '{collection_name}' 不存在。"}), 404
+            
+            # 检查并重新建立Milvus连接
+            try:
+                # 尝试检查集合是否存在，如果失败则重新连接
+                if not utility.has_collection(collection_name):
+                    return jsonify({"error": f"知识库 (集合) '{collection_name}' 不存在。"}), 404
+            except Exception as conn_error:
+                logging.warning(f"Milvus连接可能已断开，尝试重新连接: {conn_error}")
+                # 重新建立连接
+                connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+                logging.info("Milvus连接已重新建立")
+                # 再次检查集合是否存在
+                if not utility.has_collection(collection_name):
+                    return jsonify({"error": f"知识库 (集合) '{collection_name}' 不存在。"}), 404
+            
             model_to_use = get_model_for_collection(collection_name)
             query_embedding = get_ollama_embedding(query_text, model_to_use)
             collection = Collection(collection_name)
