@@ -80,7 +80,7 @@ logging.basicConfig(level=logging.INFO,
 
 # --- 初始化 ---
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # 确保 MILVUS_PORT 被正确读取
 try:
