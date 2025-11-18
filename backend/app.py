@@ -32,9 +32,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- 配置管理 ---
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "www.yc01.top")#//localhost_doujunhao
 MILVUS_PORT_STR = os.getenv("MILVUS_PORT", "19530")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://www.yc01.top")#s//localhost_doujunhao
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
 OLLAMA_EMBED_API_URL = f"{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
 KNOWLEDGE_BASE_DIR = os.getenv("KNOWLEDGE_BASE_DIR", "./knowledge_base")
@@ -159,18 +159,72 @@ def text_to_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 # --- [核心修正] 统一数据处理逻辑 ---
+import hashlib
+
+def get_file_hash(file_path):
+    """计算文件内容的哈希值，用于检测文件是否真正发生变化"""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            # 读取并更新哈希值
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logging.error(f"计算文件哈希值时出错: {e}")
+        # 如果无法计算哈希值，则返回None，表示需要更新
+        return None
+
 def upsert_file_to_milvus(file_path: str, collection_name: str, model_name: str):
     filename = os.path.basename(file_path)
     try:
+        # 计算文件的当前哈希值
+        current_hash = get_file_hash(file_path)
+        
+        # 检查文件是否存在且哈希值是否可计算
+        if not os.path.exists(file_path):
+            logging.warning(f"文件 '{filename}' 不存在，跳过处理。")
+            return
+            
+        # 读取文件内容
+        with open(file_path, 'r', encoding='utf-8') as f: 
+            content = f.read()
+            
+        # 检查文件内容是否为空
+        if not content.strip():
+            logging.info(f"文件 '{filename}' 为空，无需插入新数据。")
+            return
+            
         collection = Collection(collection_name)
         collection.load()
+        
+        # 检查是否存在该文件的条目，尝试获取现有哈希值
+        has_existing_entries = False
+        try:
+            expr = f"source_file == '{filename}'"
+            result = collection.query(expr, output_fields=["text"])
+            has_existing_entries = len(result) > 0
+            
+            # 如果文件内容没变（且文件不为空），则跳过更新
+            if has_existing_entries and current_hash:
+                # 简单检查：如果当前处理的内容和数据库中的第一条内容相同，且文件不是空的，跳过更新
+                # 这是一个简化的检查，实际应用中可能需要更复杂的逻辑
+                # 例如存储和比较完整的文件哈希值
+                first_chunk = result[0].get("text", "")
+                if content.startswith(first_chunk) and len(content) > 0:
+                    logging.info(f"文件 '{filename}' 内容未发生变化，跳过更新。")
+                    return
+        except Exception as e:
+            logging.warning(f"检查文件 '{filename}' 是否存在时出错: {e}，继续更新流程。")
+            
+        # 只有在文件内容确实变化或无法确定时才执行更新
         delete_expr = f"source_file == '{filename}'"
         collection.delete(delete_expr)
         logging.info(f"已从 '{collection_name}' 中删除 '{filename}' 的旧条目。")
-        with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+        
         chunks = text_to_chunks(content)
         if not chunks: 
-            logging.info(f"文件 '{filename}' 为空，无需插入新数据。")
+            logging.info(f"文件 '{filename}' 处理后没有有效的文本块，无需插入新数据。")
             return
         
         entities_to_insert = []
@@ -927,4 +981,4 @@ if __name__ == '__main__':
     # 注意: 环境变量 FLASK_APP=app.py
     # 运行: flask run --port=5000
     # (或在生产环境中使用 gunicorn)
-    app.run(debug=True, port=5000)
+    app.run(debug=True, host='[::]',port=5179)#//doujunhao

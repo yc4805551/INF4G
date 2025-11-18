@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactDOM from 'react-dom/client';
 import mammoth from 'mammoth';
@@ -7,7 +8,7 @@ import { GoogleGenAI } from '@google/genai';
 
 const API_BASE_URL = import.meta.env?.PROD
   ? `${import.meta.env.VITE_API_BASE_URL || ''}/api`
-  : 'http://127.0.0.1:5000/api';
+  : '/proxy-api';//doujunhao- 设置了后端连接
 
 // FIX: Modified debounce to return a function with a `clearTimeout` method to cancel pending calls.
 const debounce = <F extends (...args: any[]) => any>(func: F, waitFor: number) => {
@@ -69,7 +70,7 @@ type NoteChatMessage = {
   isComplete?: boolean;
 };
 
-type ModelProvider = 'gemini' | 'openai' | 'deepseek' | 'ali';
+type ModelProvider = 'gemini' | 'openai' | 'deepseek' | 'ali' | 'depOCR' | 'doubao';
 type ChatMessage = {
   role: 'user' | 'model';
   parts: { text: string }[];
@@ -98,8 +99,7 @@ const frontendApiConfig: Record<string, {
     model?: string;
 }> = {
     gemini: {
-        // NOTE: The API key for frontend mode is handled directly in the `callGenerativeAi` function
-        // using `import.meta.env.VITE_GEMINI_API_KEY` to comply with browser environment standards.
+        apiKey: import.meta.env?.VITE_GEMINI_API_KEY,
         model: 'gemini-2.5-flash',
     },
     openai: {
@@ -116,7 +116,17 @@ const frontendApiConfig: Record<string, {
         apiKey: import.meta.env?.VITE_ALI_API_KEY,
         endpoint: import.meta.env?.VITE_ALI_ENDPOINT || (import.meta.env?.VITE_ALI_TARGET_URL ? `${import.meta.env.VITE_ALI_TARGET_URL}/v1/chat/completions` : undefined),
         model: import.meta.env?.VITE_ALI_MODEL,
-    }
+    },
+    depOCR: {
+        apiKey: import.meta.env?.VITE_DEPOCR_API_KEY,
+        endpoint: import.meta.env?.VITE_DEPOCR_ENDPOINT,
+        model: import.meta.env?.VITE_DEPOCR_MODEL,
+    },
+    doubao: {
+        apiKey: import.meta.env?.VITE_DOUBAO_API_KEY,
+        endpoint: import.meta.env?.VITE_DOUBAO_ENDPOINT,
+        model: import.meta.env?.VITE_DOUBAO_MODEL,
+    },
 };
 
 async function callOpenAiCompatibleApi(
@@ -126,12 +136,26 @@ async function callOpenAiCompatibleApi(
     systemInstruction: string,
     userPrompt: string,
     history: ChatMessage[],
-    jsonResponse: boolean
+    jsonResponse: boolean,
+    images?: { base64: string, mimeType: string }[],
 ) {
+    const userMessageContent: any[] = [{ type: 'text', text: userPrompt }];
+    if (images && images.length > 0) {
+        images.forEach(image => {
+            userMessageContent.push({
+                type: 'image_url',
+                image_url: { url: `data:${image.mimeType};base64,${image.base64}` }
+            });
+        });
+    }
+
     const messages = [
         { role: 'system', content: systemInstruction },
-        ...history.map(h => ({ role: h.role as 'user' | 'assistant', content: h.parts[0].text })),
-        { role: 'user', content: userPrompt }
+        ...history.map(h => ({
+            role: h.role === 'model' ? 'assistant' : 'user',
+            content: h.parts[0].text
+        })),
+        { role: 'user', content: userMessageContent }
     ];
 
     const body: any = {
@@ -139,6 +163,9 @@ async function callOpenAiCompatibleApi(
         messages,
         stream: false,
     };
+    if (images && images.length > 0) {
+        body.max_tokens = 4096;
+    }
 
     if (jsonResponse) {
         body.response_format = { type: 'json_object' };
@@ -176,7 +203,10 @@ async function callOpenAiCompatibleApiStream(
     try {
         const messages = [
             { role: 'system', content: systemInstruction },
-            ...history.map(h => ({ role: h.role as 'user' | 'assistant', content: h.parts[0].text })),
+            ...history.map(h => ({
+                role: h.role === 'model' ? 'assistant' : 'user',
+                content: h.parts[0].text
+            })),
             { role: 'user', content: userPrompt }
         ];
 
@@ -241,8 +271,9 @@ const callGenerativeAi = async (
     systemInstruction: string,
     userPrompt: string,
     jsonResponse: boolean,
-    mode: 'notes' | 'audit' | 'roaming' | 'writing' | null,
-    history: ChatMessage[] = []
+    mode: 'notes' | 'audit' | 'roaming' | 'writing' | 'ocr' | null,
+    history: ChatMessage[] = [],
+    images?: { base64: string, mimeType: string }[],
 ) => {
     if (executionMode === 'frontend') {
         const config = frontendApiConfig[provider];
@@ -251,17 +282,26 @@ const callGenerativeAi = async (
         }
 
         if (provider === 'gemini') {
-            // NOTE: The @google/genai guideline specifies using process.env.API_KEY, which is for Node.js environments.
-            // For frontend execution in Vite, we must use import.meta.env to access environment variables.
-            const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-            if (!apiKey) {
-                throw new Error(`Frontend direct mode for Gemini is not configured. Please set VITE_GEMINI_API_KEY in your environment.`);
+            if (!config.apiKey) {
+                throw new Error(`Frontend Direct mode for ${provider} is not configured. Please set VITE_GEMINI_API_KEY in your environment.`);
             }
-            const ai = new GoogleGenAI({ apiKey });
-            const fullContents = [...history, { role: 'user', parts: [{ text: userPrompt }] }];
+            const ai = new GoogleGenAI({ apiKey: config.apiKey });
+
+            const userParts: any[] = [{ text: userPrompt }];
+            if (images && images.length > 0) {
+                const imageParts = images.map(img => ({
+                    inlineData: {
+                        mimeType: img.mimeType,
+                        data: img.base64,
+                    }
+                }));
+                userParts.unshift(...imageParts);
+            }
+            const fullContents = [...history, { role: 'user', parts: userParts }];
+
 
             const response = await ai.models.generateContent({
-                model: config.model,
+                model: (images && images.length > 0) ? 'gemini-2.5-flash' : config.model, // Use vision model if image is present
                 contents: fullContents as any, // Cast to any to align with SDK expectations
                 config: {
                     systemInstruction: systemInstruction,
@@ -283,7 +323,8 @@ const callGenerativeAi = async (
                 systemInstruction,
                 userPrompt,
                 history,
-                jsonResponse
+                jsonResponse,
+                images,
             );
         }
 
@@ -294,7 +335,7 @@ const callGenerativeAi = async (
                 const response = await fetch(`${API_BASE_URL}/generate`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ provider, systemInstruction, userPrompt, jsonResponse, mode, history })
+                    body: JSON.stringify({ provider, systemInstruction, userPrompt, jsonResponse, mode, history, images })
                 });
                 
                 if (!response.ok) {
@@ -343,13 +384,10 @@ const callGenerativeAiStream = async (
             }
             
             if (provider === 'gemini') {
-                // NOTE: The @google/genai guideline specifies using process.env.API_KEY, which is for Node.js environments.
-                // For frontend execution in Vite, we must use import.meta.env to access environment variables.
-                const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-                if (!apiKey) {
-                    throw new Error(`Frontend direct mode for Gemini is not configured. Please set VITE_GEMINI_API_KEY in your environment.`);
+                if (!config.apiKey) {
+                    throw new Error(`Frontend Direct mode for ${provider} is not configured. Please set VITE_GEMINI_API_KEY in your environment.`);
                 }
-                const ai = new GoogleGenAI({ apiKey });
+                const ai = new GoogleGenAI({ apiKey: config.apiKey });
                 const fullContents = [...history, { role: 'user', parts: [{ text: userPrompt }] }];
                 
                 const streamResult = await ai.models.generateContentStream({
@@ -471,6 +509,7 @@ const HomeInputView = ({
   setSelectedKnowledgeBase,
   onKnowledgeChat,
   onWriting,
+  onTextRecognition,
   executionMode,
   setExecutionMode,
 }: {
@@ -488,6 +527,7 @@ const HomeInputView = ({
   setSelectedKnowledgeBase: (id: string) => void;
   onKnowledgeChat: () => void;
   onWriting: () => void;
+  onTextRecognition: () => void;
   executionMode: ExecutionMode;
   setExecutionMode: (mode: ExecutionMode) => void;
 }) => {
@@ -581,7 +621,7 @@ const HomeInputView = ({
     }
   };
 
-  const modelProviders: ModelProvider[] = ['gemini', 'openai', 'deepseek', 'ali'];
+  const modelProviders: ModelProvider[] = ['gemini', 'openai', 'deepseek', 'ali', 'depOCR', 'doubao'];
 
   return (
     <>
@@ -687,10 +727,13 @@ const HomeInputView = ({
                 2. 审阅文本
             </button>
             <button className="action-btn" onClick={onKnowledgeChat} disabled={!inputText || isProcessing || !selectedKnowledgeBase}>
-                3. 知识库对话
+                3. 内参对话
             </button>
             <button className="action-btn" onClick={onWriting} disabled={isProcessing}>
-                4. 沉浸式写作
+                4. 沉浸写作
+            </button>
+            <button className="action-btn" onClick={onTextRecognition} disabled={isProcessing}>
+                5. 文本识别
             </button>
         </div>
     </>
@@ -890,10 +933,13 @@ const NoteAnalysisView = ({
 
       const systemInstruction = `You are a helpful assistant. The user has just organized a note and wants to discuss it. The note's organized content is provided below. Your role is to answer questions, help refine the text, or brainstorm ideas based on this note. Be helpful and conversational.\n\n--- NOTE START ---\n${analysisResult.organizedText}\n--- NOTE END ---`;
       
-      const chatHistoryForApi = currentChatHistory.slice(0, -1).map(msg => ({ // Exclude the user message we just added
-          role: msg.role as 'user' | 'model',
-          parts: [{ text: msg.text }]
-      }));
+      const chatHistoryForApi = currentChatHistory
+        .slice(0, -1) // Exclude the user message we just added
+        .filter(msg => !(msg.role === 'model' && msg.text.startsWith('您好！您可以针对这篇笔记进行提问'))) // Exclude the initial UI-only message
+        .map(msg => ({ 
+            role: msg.role as 'user' | 'model',
+            parts: [{ text: msg.text }]
+        }));
 
       const modelResponse: NoteChatMessage = { role: 'model', text: '' };
       setChatHistory(prev => [...prev, modelResponse]);
@@ -1196,7 +1242,7 @@ const AuditView = ({
         setAuditResults({});
         setSelectedIssueId(null);
 
-        const allModels: ModelProvider[] = ['gemini', 'openai', 'deepseek', 'ali'];
+        const allModels: ModelProvider[] = ['gemini', 'openai', 'deepseek', 'ali', 'depOCR', 'doubao'];
 
         const systemInstruction = `You are a professional editor. Analyze the provided text based ONLY on the rules in the following checklist. For each issue you find, return a JSON object with "problematicText" (the exact, verbatim text segment from the original), "suggestion" (your proposed improvement), "checklistItem" (the specific rule from the checklist that was violated), and "explanation" (a brief explanation of why it's a problem). Your entire response MUST be a single JSON array of these objects, or an empty array [] if no issues are found.
 
@@ -1728,17 +1774,99 @@ const WritingView = ({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [styleReferenceText, setStyleReferenceText] = useState('');
-  const [copySuccess, setCopySuccess] = useState('');
+  const [copyMessage, setCopyMessage] = useState<{text: string; type: 'success' | 'error'} | null>(null);
 
   const [kbResults, setKbResults] = useState<Source[] | null>(null);
   const [isKbSearching, setIsKbSearching] = useState(false);
   const [kbError, setKbError] = useState<string | null>(null);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState<number | null>(null);
 
+  // New state for chat
+  const [chatHistory, setChatHistory] = useState<NoteChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const chatHistoryRef = useRef<HTMLDivElement>(null);
+
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const styleFileRef = useRef<HTMLInputElement>(null);
   const suppressSuggestionFetch = useRef(false);
   const fetchIdRef = useRef(0);
+
+  // For resizable panel and responsive layout
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isResizingRef = useRef(false);
+  const [panelGridStyle, setPanelGridStyle] = useState({ gridTemplateColumns: '2fr 8px 1fr' });
+  const [isMobileLayout, setIsMobileLayout] = useState(window.innerWidth <= 1000);
+
+  const debouncedResizeHandler = useRef(
+    debounce(() => {
+      setIsMobileLayout(window.innerWidth <= 1000);
+    }, 200)
+  ).current;
+
+  useEffect(() => {
+    const handler = () => debouncedResizeHandler();
+    window.addEventListener('resize', handler);
+    handler(); // Initial check
+    return () => {
+      window.removeEventListener('resize', handler);
+      debouncedResizeHandler.clearTimeout();
+    };
+  }, [debouncedResizeHandler]);
+
+
+  useEffect(() => {
+    // Initialize chat with a welcome message
+    setChatHistory([{ role: 'model', text: '您好！我是您的写作助手，您可以随时向我提问。' }]);
+  }, []);
+
+  useEffect(() => {
+    if (chatHistoryRef.current) {
+        chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
+    }
+  }, [chatHistory]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const handleMouseUp = () => {
+    isResizingRef.current = false;
+    document.body.style.cursor = 'default';
+    document.body.style.userSelect = 'auto';
+    window.removeEventListener('mousemove', handleMouseMove);
+    window.removeEventListener('mouseup', handleMouseUp);
+  };
+
+  const handleMouseMove = useCallback((e: MouseEvent) => {
+    if (isResizingRef.current && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const editorPanelWidth = e.clientX - rect.left;
+      // Subtract resizer width from the assistant panel width
+      const assistantPanelWidth = rect.right - e.clientX - 8; 
+      
+      // Set min widths to prevent collapsing
+      if (editorPanelWidth > 300 && assistantPanelWidth > 300) { 
+        setPanelGridStyle({
+          gridTemplateColumns: `${editorPanelWidth}px 8px ${assistantPanelWidth}px`
+        });
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    // Cleanup event listeners when component unmounts
+    return () => {
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [handleMouseMove]);
+
 
   const fetchSuggestions = useCallback(debounce(async (currentText: string, styleText: string) => {
     if (currentText.trim().length < 50) { // Don't run on very short text
@@ -1751,7 +1879,7 @@ const WritingView = ({
     setSelectedSuggestionIndex(null);
 
     let systemInstruction = `你是一位专业的中文写作助理。你的任务是实时帮助用户改进他们的中文写作。
-- 分析所提供的文本，并找出最多3个关键的改进点。
+- 分析所提供的文本，并找出最多6个关键的改进点。
 - 保持文档原有的语调和风格。
 - 针对每一条建议，提供精准的原文片段 ("originalText")、你修改后的版本 ("revisedText")，以及简明扼要的修改说明 ("explanation")。
 - 你所有的输出，包括建议和说明，都必须是中文。
@@ -1773,11 +1901,8 @@ ${styleText.trim()}
     try {
       const responseText = await callGenerativeAi(selectedModel, executionMode, systemInstruction, userPrompt, true, 'writing');
       
-      // If another request has started, ignore the result of this one to prevent race conditions.
       if (fetchId !== fetchIdRef.current) return;
 
-      // --- ⬇️ 关键修改在这里 ---
-      // 1. 使用 <unknown> 来解析，这样我们可以先检查它的结构
       const { data, error: parseError, rawResponse } = parseJsonResponse<unknown>(responseText);
 
       if (parseError || !data) {
@@ -1787,23 +1912,18 @@ ${styleText.trim()}
       
       let suggestionsArray: WritingSuggestion[] = [];
 
-      // 2. 检查 data 是否是一个数组
       if (Array.isArray(data)) {
         suggestionsArray = data as WritingSuggestion[];
       }
-      // 3. 检查 data 是否是一个包含 'suggestions' 键的对象
       else if (typeof data === 'object' && data !== null && 'suggestions' in data && Array.isArray((data as { suggestions: any }).suggestions)) {
         suggestionsArray = (data as { suggestions: WritingSuggestion[] }).suggestions;
       }
-      // 4. 如果两种都不是，说明格式错误
       else {
         throw new Error("Model returned an unexpected JSON format (not an array, or an object with 'suggestions').");
       }
 
-      // 5. 在“清洗”过的数组上安全地调用 .filter
       const validSuggestions = suggestionsArray.filter(s => s.originalText && s.revisedText && s.explanation);
       setSuggestions(validSuggestions);
-      // --- ⬆️ 修改结束 ---
 
     } catch (err: any) {
       if (fetchId === fetchIdRef.current) {
@@ -1820,7 +1940,7 @@ ${styleText.trim()}
   useEffect(() => {
     onTextChange(text);
     if (suppressSuggestionFetch.current) {
-        suppressSuggestionFetch.current = false; // Reset for next non-apply update
+        suppressSuggestionFetch.current = false;
         return;
     }
     fetchSuggestions(text, styleReferenceText);
@@ -1830,11 +1950,11 @@ ${styleText.trim()}
     suppressSuggestionFetch.current = true;
     setText(prevText => prevText.replace(suggestion.originalText, suggestion.revisedText));
     setSuggestions(prev => prev.filter(s => s !== suggestion));
-    setSelectedSuggestionIndex(null); // Deselect after applying
+    setSelectedSuggestionIndex(null);
   };
   
   const handleRefresh = () => {
-      fetchSuggestions.clearTimeout(); // Cancel any pending debounced call
+      fetchSuggestions.clearTimeout();
       fetchSuggestions(text, styleReferenceText);
   };
   
@@ -1852,15 +1972,48 @@ ${styleText.trim()}
   };
 
   const handleCopy = () => {
-    if (text && navigator.clipboard) {
+    if (!text) return;
+
+    const copyLegacy = () => {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        // Make the textarea invisible and out of the viewport
+        textArea.style.position = 'fixed';
+        textArea.style.top = '-9999px';
+        textArea.style.left = '-9999px';
+        
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+
+        try {
+            const successful = document.execCommand('copy');
+            if (successful) {
+                setCopyMessage({ text: '已复制!', type: 'success' });
+            } else {
+                setCopyMessage({ text: '复制失败!', type: 'error' });
+            }
+        } catch (err) {
+            console.error('Fallback copy method failed:', err);
+            setCopyMessage({ text: '复制失败!', type: 'error' });
+        }
+
+        document.body.removeChild(textArea);
+        setTimeout(() => setCopyMessage(null), 2000);
+    };
+    
+    // Use modern clipboard API if available and in a secure context
+    if (navigator.clipboard && window.isSecureContext) {
         navigator.clipboard.writeText(text).then(() => {
-            setCopySuccess('已复制!');
-            setTimeout(() => setCopySuccess(''), 2000);
+            setCopyMessage({ text: '已复制!', type: 'success' });
+            setTimeout(() => setCopyMessage(null), 2000);
         }).catch(err => {
-            setCopySuccess('复制失败!');
-            setTimeout(() => setCopySuccess(''), 2000);
-            console.error('Failed to copy text: ', err)
+            console.error('Clipboard API failed, trying fallback:', err);
+            copyLegacy();
         });
+    } else {
+        console.warn('Clipboard API not available, using fallback.');
+        copyLegacy();
     }
   };
   
@@ -1873,35 +2026,24 @@ ${styleText.trim()}
         setKbError("请写入更多内容以便进行有效检索。");
         return;
     }
-
     setIsKbSearching(true);
     setKbError(null);
     setKbResults(null);
-
     try {
         const backendResponse = await fetch(`${API_BASE_URL}/find-related`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                text: text,
-                collection_name: selectedKnowledgeBase,
-                top_k: 3
-            })
+            body: JSON.stringify({ text: text, collection_name: selectedKnowledgeBase, top_k: 3 })
         });
         if (!backendResponse.ok) {
             const errorText = await backendResponse.text();
             throw new Error(errorText || "知识库查询失败。");
         }
         const data = await backendResponse.json();
-        if (data.error) {
-            throw new Error(data.error);
-        }
+        if (data.error) throw new Error(data.error);
         const sources = data.related_documents || [];
         setKbResults(sources);
-        if (sources.length === 0) {
-            setKbError("未找到相关内容。");
-        }
-
+        if (sources.length === 0) setKbError("未找到相关内容。");
     } catch (err: any) {
         setKbError(`知识库检索出错: ${err.message}`);
     } finally {
@@ -1909,10 +2051,71 @@ ${styleText.trim()}
     }
   };
 
+  const handleSendWritingChatMessage = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!chatInput.trim() || isChatLoading) return;
+
+    const newUserMessage: NoteChatMessage = { role: 'user', text: chatInput };
+    const currentHistory = [...chatHistory, newUserMessage];
+    setChatHistory(currentHistory);
+    setChatInput('');
+    setIsChatLoading(true);
+
+    const systemInstruction = `You are a writing assistant. The user is currently writing the following text and has a question about it. Your role is to answer questions, help refine the text, or brainstorm ideas based on this text. Be helpful and conversational.\n\n--- CURRENT TEXT ---\n${text}\n--- END TEXT ---`;
+    
+    const chatHistoryForApi = currentHistory
+      .slice(0, -1)
+      .filter(msg => !(msg.role === 'model' && msg.text.startsWith('您好！我是您的写作助手')))
+      .map(msg => ({ role: msg.role, parts: [{ text: msg.text }] }));
+    
+    const modelResponse: NoteChatMessage = { role: 'model', text: '' };
+    setChatHistory(prev => [...prev, modelResponse]);
+
+    try {
+        await callGenerativeAiStream(
+            selectedModel, executionMode, systemInstruction, chatInput, chatHistoryForApi,
+            (chunk) => {
+                setChatHistory(prev => {
+                    const newHistory = [...prev];
+                    const lastMessage = newHistory[newHistory.length - 1];
+                    if (lastMessage?.role === 'model') {
+                        lastMessage.text += chunk;
+                    }
+                    return newHistory;
+                });
+            },
+            () => { setIsChatLoading(false); },
+            (error) => {
+                setChatHistory(prev => {
+                    const newHistory = [...prev];
+                    const lastMessage = newHistory[newHistory.length - 1];
+                    if (lastMessage?.role === 'model') {
+                        lastMessage.isError = true;
+                        lastMessage.text = `抱歉，出错了: ${error.message}`;
+                    }
+                    return newHistory;
+                });
+                setIsChatLoading(false);
+            }
+        );
+    } catch (error: any) {
+        setChatHistory(prev => {
+            const newHistory = [...prev];
+            const lastMessage = newHistory[newHistory.length - 1];
+            if (lastMessage?.role === 'model') {
+                lastMessage.isError = true;
+                lastMessage.text = `抱歉，出错了: ${error.message}`;
+            }
+            return newHistory;
+        });
+        setIsChatLoading(false);
+    }
+  };
+
+
   const processStyleFile = async (file: File) => {
     if (!file) return;
     const reader = new FileReader();
-
     reader.onload = async (event) => {
         const fileContent = event.target?.result;
         let fileText = '';
@@ -1921,7 +2124,6 @@ ${styleText.trim()}
                 const result = await mammoth.extractRawText({ arrayBuffer: fileContent as ArrayBuffer });
                 fileText = result.value;
             } catch (err) {
-                console.error("Error reading docx file", err);
                 setError("无法解析 DOCX 文件。");
                 return;
             }
@@ -1930,7 +2132,6 @@ ${styleText.trim()}
         }
         setStyleReferenceText(fileText);
     };
-    
     if (file.name.endsWith('.docx')) {
         reader.readAsArrayBuffer(file);
     } else if (file.name.endsWith('.txt') || file.name.endsWith('.md')) {
@@ -1952,13 +2153,20 @@ ${styleText.trim()}
   };
 
   return (
-    <div className="writing-view-container">
+    <div 
+        ref={containerRef} 
+        className={`writing-view-container ${isMobileLayout ? 'mobile-layout' : ''}`}
+        style={!isMobileLayout ? panelGridStyle : undefined}
+    >
       <div className="writing-editor-panel">
          <div className="assistant-panel-header">
             <h2>沉浸式写作</h2>
-            <button className="btn btn-secondary" onClick={handleCopy} disabled={!text}>
-                 {copySuccess || '复制全文'}
-            </button>
+            <div className="header-actions">
+                {copyMessage && <span className={`copy-message ${copyMessage.type}`}>{copyMessage.text}</span>}
+                <button className="btn btn-secondary" onClick={handleCopy} disabled={!text}>
+                    复制全文
+                </button>
+            </div>
         </div>
         <textarea
           ref={editorRef}
@@ -1968,6 +2176,9 @@ ${styleText.trim()}
           placeholder="在此开始写作，AI 将在您停顿时提供建议..."
         />
       </div>
+      
+      {!isMobileLayout && <div className="resizer" onMouseDown={handleMouseDown}></div>}
+
       <div className="writing-assistant-panel">
         <div className="assistant-panel-header">
             <h2 style={{textTransform: 'capitalize'}}>AI 助手 ({selectedModel})</h2>
@@ -1977,36 +2188,65 @@ ${styleText.trim()}
             </button>
         </div>
         <div className="assistant-content">
-          {isLoading && <div className="spinner-container"><div className="spinner large" /></div>}
-          {!isLoading && error && <div className="error-message">{error}</div>}
-          {!isLoading && !error && suggestions.length === 0 && (
-            <div className="large-placeholder">
-              <p>暂无建议。</p>
-              <p className="instruction-text">请继续写作，或确保文本长度超过50个字符以便AI分析。</p>
-            </div>
-          )}
-          {!isLoading && !error && suggestions.length > 0 && (
-            <div className="suggestions-list">
-              {suggestions.map((s, i) => (
-                <div 
-                  key={i} 
-                  className={`suggestion-card ${selectedSuggestionIndex === i ? 'selected' : ''}`}
-                  onClick={() => handleSuggestionClick(s, i)}
-                >
-                  <div className="suggestion-body">
-                    <p><strong>差异对比:</strong></p>
-                    <DiffView originalText={s.originalText} revisedText={s.revisedText} />
-                    <p style={{marginTop: '8px'}}><strong>说明:</strong> {s.explanation}</p>
+          <div className="suggestions-container">
+            {isLoading && <div className="spinner-container"><div className="spinner large" /></div>}
+            {!isLoading && error && <div className="error-message">{error}</div>}
+            {!isLoading && !error && suggestions.length === 0 && (
+              <div className="large-placeholder">
+                <p>暂无建议。</p>
+                <p className="instruction-text">请继续写作，或确保文本长度超过50个字符以便AI分析。</p>
+              </div>
+            )}
+            {!isLoading && !error && suggestions.length > 0 && (
+              <div className="suggestions-list">
+                {suggestions.map((s, i) => (
+                  <div 
+                    key={i} 
+                    className={`suggestion-card ${selectedSuggestionIndex === i ? 'selected' : ''}`}
+                    onClick={() => handleSuggestionClick(s, i)}
+                  >
+                    <div className="suggestion-body">
+                      <p><strong>差异对比:</strong></p>
+                      <DiffView originalText={s.originalText} revisedText={s.revisedText} />
+                      <p style={{marginTop: '8px'}}><strong>说明:</strong> {s.explanation}</p>
+                    </div>
+                    <div className="suggestion-actions">
+                      <button className="btn btn-primary" onClick={(e) => { e.stopPropagation(); handleApplySuggestion(s); }}>
+                        应用此建议
+                      </button>
+                    </div>
                   </div>
-                  <div className="suggestion-actions">
-                    <button className="btn btn-primary" onClick={(e) => { e.stopPropagation(); handleApplySuggestion(s); }}>
-                      应用此建议
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="writing-chat-container">
+              <h4>连续对话</h4>
+              <div className="kb-chat-history" ref={chatHistoryRef}>
+                {chatHistory.map((msg, index) => (
+                    <div key={index} className={`kb-message ${msg.role} ${msg.isError ? 'error' : ''}`}>
+                         <div className="message-content" style={{padding: '8px 12px', maxWidth: '100%'}}>
+                            <p>{msg.text}</p>
+                        </div>
+                    </div>
+                ))}
+                {isChatLoading && chatHistory[chatHistory.length - 1]?.role === 'model' && !chatHistory[chatHistory.length - 1]?.text && (
+                    <div className="spinner-container" style={{padding: '10px 0'}}><div className="spinner"></div></div>
+                )}
+              </div>
+              <form className="chat-input-form" onSubmit={handleSendWritingChatMessage}>
+                <textarea
+                    className="chat-input"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendWritingChatMessage(); }}}
+                    placeholder="就当前文本提问..."
+                    rows={1}
+                    disabled={isChatLoading}
+                />
+                <button type="submit" className="btn btn-primary send-btn" disabled={isChatLoading || !chatInput.trim()}>发送</button>
+              </form>
+          </div>
         </div>
         <div className="style-reference-section">
             <h4>写作风格参考 (可选)</h4>
@@ -2032,37 +2272,407 @@ ${styleText.trim()}
                 </button>
             </div>
         </div>
-        <div className="kb-search-section">
-            <h4>知识库探索</h4>
-            <button className="btn btn-secondary" onClick={handleKbSearch} disabled={isKbSearching || !selectedKnowledgeBase}>
-                {isKbSearching ? <span className="spinner"></span> : null}
-                {isKbSearching ? '检索中...' : '检索关联内容'}
-            </button>
-            {kbError && <div className="error-message" style={{textAlign: 'left'}}>{kbError}</div>}
-            {kbResults && (
-                <div className="source-info-box" style={{marginTop: '8px'}}>
-                    <ul className="source-list" style={{maxHeight: '150px', padding: '12px'}}>
-                        {kbResults.map((source: Source, i: number) => (
-                            <li key={i} className="source-item" data-filename={source.source_file}>
-                                <div className="source-header">
-                                    <span className="source-filename">{source.source_file}</span>
-                                    <span className="source-score">Relevance: {source.score.toFixed(2)}</span>
-                                </div>
-                                <p className="source-chunk">"{source.content_chunk}"</p>
-                            </li>
-                        ))}
-                    </ul>
-                </div>
-            )}
-        </div>
       </div>
     </div>
   );
 };
 
+const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const base64String = reader.result?.toString().split(',')[1];
+            if (base64String) {
+                resolve(base64String);
+            } else {
+                reject(new Error("Failed to convert blob to base64"));
+            }
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+};
+
+const TextRecognitionView = ({ provider, executionMode }: { provider: ModelProvider; executionMode: ExecutionMode; }) => {
+    const [files, setFiles] = useState<File[]>([]);
+    const [recognizedText, setRecognizedText] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [progressMessage, setProgressMessage] = useState('');
+    const [recognitionModel, setRecognitionModel] = useState<ModelProvider | null>(null);
+
+    const [chatHistory, setChatHistory] = useState<NoteChatMessage[]>([]);
+    const [chatInput, setChatInput] = useState('');
+    const [isChatLoading, setIsChatLoading] = useState(false);
+    const chatHistoryRef = useRef<HTMLDivElement>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    
+    const chatModelProviders: ModelProvider[] = ['gemini', 'openai', 'deepseek', 'ali', 'doubao'];
+    const [chatProvider, setChatProvider] = useState<ModelProvider>(
+      chatModelProviders.includes(provider) ? provider : 'gemini'
+    );
+
+    useEffect(() => {
+        setChatHistory([{ role: 'model', text: '您好！上传文档并识别后，您可以在此就识别出的文本内容进行提问。' }]);
+    }, []);
+
+    useEffect(() => {
+        if (chatHistoryRef.current) {
+            chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
+        }
+    }, [chatHistory]);
+    
+    const handleClear = () => {
+        setFiles([]);
+        setRecognizedText('');
+        setError(null);
+        setProgressMessage('');
+        setChatHistory([{ role: 'model', text: '您好！上传文档并识别后，您可以在此就识别出的文本内容进行提问。' }]);
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
+    };
+
+    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const selectedFiles = e.target.files;
+        if (!selectedFiles || selectedFiles.length === 0) return;
+
+        setRecognizedText('');
+        setError(null);
+        setProgressMessage('');
+
+        const newFiles = Array.from(selectedFiles);
+        // FIX: Explicitly type 'f' as File to resolve an inference error where its type was 'unknown'.
+        const supportedFiles = newFiles.filter((f: File) => 
+            f.type.startsWith('image/') || f.type === 'application/pdf'
+        );
+
+        if (supportedFiles.length < newFiles.length) {
+            setError("已过滤不支持的文件类型。请上传 PNG, JPG, 或 PDF 文件。");
+        }
+
+        setFiles(prev => [...prev, ...supportedFiles]);
+    };
+    
+    const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.currentTarget.classList.add('drag-over');
+    };
+
+    const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.currentTarget.classList.remove('drag-over');
+    };
+
+    const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.currentTarget.classList.remove('drag-over');
+
+        const droppedFiles = e.dataTransfer.files;
+        if (!droppedFiles || droppedFiles.length === 0) return;
+        
+        setRecognizedText('');
+        setError(null);
+        setProgressMessage('');
+
+        const newFiles = Array.from(droppedFiles);
+        // FIX: Explicitly type 'f' as File to resolve an inference error where its type was 'unknown'.
+        const supportedFiles = newFiles.filter((f: File) => 
+            f.type.startsWith('image/') || f.type === 'application/pdf'
+        );
+
+        if (supportedFiles.length < newFiles.length) {
+            setError("已过滤不支持的文件类型。请上传 PNG, JPG, 或 PDF 文件。");
+        }
+
+        setFiles(prev => [...prev, ...supportedFiles]);
+        e.dataTransfer.clearData();
+    };
+
+    const pdfToImages = async (pdfFile: File): Promise<string[]> => {
+        const images: string[] = [];
+        const pdfJS = (window as any).pdfjsLib;
+        if (!pdfJS) {
+            throw new Error("PDF library is not loaded.");
+        }
+        pdfJS.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.5.136/pdf.worker.min.mjs`;
+
+        const arrayBuffer = await pdfFile.arrayBuffer();
+        const pdf = await pdfJS.getDocument(arrayBuffer).promise;
+        const numPages = pdf.numPages;
+
+        for (let i = 1; i <= numPages; i++) {
+            setProgressMessage(`正在处理 PDF 页面 ${i} / ${numPages}...`);
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: 2.0 }); // Higher scale for better OCR quality
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            if (context) {
+                await page.render({ canvasContext: context, viewport: viewport }).promise;
+                const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+                if (blob) {
+                    const base64 = await blobToBase64(blob);
+                    images.push(base64);
+                }
+            }
+        }
+        return images;
+    };
+
+
+    const handleRecognize = async (ocrProvider: ModelProvider) => {
+        if (files.length === 0) {
+            setError("请先选择一个文件。");
+            return;
+        }
+        setIsLoading(true);
+        setRecognitionModel(ocrProvider);
+        setError(null);
+        setRecognizedText('');
+        setProgressMessage('准备开始处理...');
+
+        try {
+            const imagesToProcess: { base64: string, mimeType: string }[] = [];
+            
+            let fileCounter = 0;
+            for (const file of files) {
+                fileCounter++;
+                setProgressMessage(`正在处理文件 ${fileCounter} / ${files.length}: ${file.name}...`);
+                if (file.type.startsWith('image/')) {
+                    const base64Image = await blobToBase64(file);
+                    imagesToProcess.push({ base64: base64Image, mimeType: file.type });
+                } else if (file.type === 'application/pdf') {
+                    const base64Images = await pdfToImages(file);
+                    base64Images.forEach(b64 => {
+                        imagesToProcess.push({ base64: b64, mimeType: 'image/jpeg' });
+                    });
+                }
+            }
+
+            if (imagesToProcess.length === 0) {
+                throw new Error("没有可供识别的有效图片。");
+            }
+            
+            setProgressMessage('正在调用 AI 模型进行识别...');
+            const systemInstruction = `You are an expert Optical Character Recognition (OCR) engine. Your task is to extract any and all text from the provided image(s).
+- Transcribe the text exactly as it appears.
+- If multiple images are provided, treat them as pages of a single document and return the text in sequential order.
+- Preserve the original line breaks and formatting as much as possible.
+- Return only the extracted text, with no additional commentary, summaries, or explanations.`;
+            const userPrompt = "Extract all text from the provided image(s), in order.";
+
+            const responseText = await callGenerativeAi(
+                ocrProvider,
+                executionMode,
+                systemInstruction,
+                userPrompt,
+                false,
+                'ocr',
+                [],
+                imagesToProcess
+            );
+
+            setRecognizedText(responseText);
+
+        } catch (err: any) {
+            setError(`文本识别失败 (${ocrProvider}): ${err.message}`);
+        } finally {
+            setIsLoading(false);
+            setRecognitionModel(null);
+            setProgressMessage('');
+        }
+    };
+
+    const handleSendChatMessage = async (e?: React.FormEvent) => {
+        e?.preventDefault();
+        if (!chatInput.trim() || isChatLoading) return;
+
+        const newUserMessage: NoteChatMessage = { role: 'user', text: chatInput };
+        const currentHistory = [...chatHistory, newUserMessage];
+        setChatHistory(currentHistory);
+        setChatInput('');
+        setIsChatLoading(true);
+
+        const systemInstruction = `You are a helpful assistant. The user has performed OCR on a document, and the recognized text is provided below. Your role is to answer questions, summarize, or analyze this text based on the user's request. Be helpful and conversational.\n\n--- RECOGNIZED TEXT ---\n${recognizedText}\n--- END TEXT ---`;
+
+        const chatHistoryForApi = currentHistory
+          .slice(0, -1)
+          .filter(msg => !(msg.role === 'model' && msg.text.startsWith('您好！')))
+          .map(msg => ({ role: msg.role as 'user' | 'model', parts: [{ text: msg.text }] }));
+
+        const modelResponse: NoteChatMessage = { role: 'model', text: '' };
+        setChatHistory(prev => [...prev, modelResponse]);
+
+        try {
+            await callGenerativeAiStream(
+                chatProvider, executionMode, systemInstruction, chatInput, chatHistoryForApi,
+                (chunk) => {
+                    setChatHistory(prev => {
+                        const newHistory = [...prev];
+                        newHistory[newHistory.length - 1].text += chunk;
+                        return newHistory;
+                    });
+                },
+                () => { setIsChatLoading(false); },
+                (error) => {
+                    setChatHistory(prev => {
+                        const newHistory = [...prev];
+                        newHistory[newHistory.length - 1].isError = true;
+                        newHistory[newHistory.length - 1].text = `抱歉，出错了: ${error.message}`;
+                        return newHistory;
+                    });
+                    setIsChatLoading(false);
+                }
+            );
+        } catch (error: any) {
+            setChatHistory(prev => {
+                const newHistory = [...prev];
+                newHistory[newHistory.length - 1].isError = true;
+                newHistory[newHistory.length - 1].text = `抱歉，出错了: ${error.message}`;
+                return newHistory;
+            });
+            setIsChatLoading(false);
+        }
+    };
+
+    return (
+        <div className="ocr-view-container">
+            <div className="file-upload-panel">
+                <h2>1. 上传文件</h2>
+                <div className="file-drop-zone" onClick={() => fileInputRef.current?.click()} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+                    <input
+                        type="file"
+                        ref={fileInputRef}
+                        style={{ display: 'none' }}
+                        accept=".png,.jpg,.jpeg,.pdf"
+                        onChange={handleFileChange}
+                        multiple
+                    />
+                    {files.length > 0 ? (
+                        <div className="file-list-preview">
+                            <ul>
+                                {files.map((f, index) => (
+                                    <li key={`${f.name}-${index}`}>
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                                            <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"></path>
+                                        </svg>
+                                        <span>{f.name}</span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    ) : (
+                        <p>点击或拖拽 PNG/JPG/PDF 文件到此处 (支持多文件)</p>
+                    )}
+                </div>
+                 {files.length > 0 && <p className="instruction-text" style={{textAlign: 'center'}}>已选择 {files.length} 个文件</p>}
+                <div className="utility-btn-group ocr-action-buttons">
+                    <button className="btn btn-secondary" onClick={handleClear} disabled={(files.length === 0 && !recognizedText) || isLoading}>
+                        清空内容
+                    </button>
+                    <div className="ocr-recognition-button-group">
+                        <button
+                            className="btn btn-primary"
+                            onClick={() => handleRecognize('depOCR')}
+                            disabled={files.length === 0 || isLoading}
+                            title="使用专门优化的OCR模型进行识别"
+                        >
+                            {isLoading && recognitionModel === 'depOCR' ? 
+                                <><span className="spinner"></span> {progressMessage || '识别中...'}</> : 
+                                `2. 识别 (depOCR)`
+                            }
+                        </button>
+                        {provider !== 'depOCR' && (
+                            <button
+                                className="btn btn-primary"
+                                onClick={() => handleRecognize(provider)}
+                                disabled={files.length === 0 || isLoading}
+                                title={`使用全局选择的 ${provider} 模型进行多模态识别`}
+                            >
+                                {isLoading && recognitionModel === provider ? 
+                                    <><span className="spinner"></span> {progressMessage || '识别中...'}</> :
+                                    `2. 识别 (${provider})`
+                                }
+                            </button>
+                        )}
+                    </div>
+                </div>
+            </div>
+            <div className="ocr-results-panel">
+                <div className="view-header-row">
+                    <h2>3. 识别结果与讨论</h2>
+                    <div className="model-selector-container">
+                        <span className="model-selector-label">对话模型:</span>
+                        <div className="model-selector-group small">
+                            {chatModelProviders.map(model => (
+                                <button
+                                    key={model}
+                                    className={`model-btn ${chatProvider === model ? 'active' : ''}`}
+                                    onClick={() => setChatProvider(model)}
+                                    disabled={isChatLoading}
+                                >
+                                    {model}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+                <div className="ocr-result-and-chat-area">
+                    <div className="ocr-result-container">
+                        {isLoading && !recognizedText && (
+                             <div className="spinner-container">
+                                <div className="spinner large"></div>
+                                <p>{progressMessage || '正在调用模型进行识别...'}</p>
+                            </div>
+                        )}
+                        {!isLoading && !recognizedText && !error && (
+                            <div className="large-placeholder">
+                                <p>识别结果将显示在此处。</p>
+                            </div>
+                        )}
+                        {error && <div className="error-message" style={{margin: '16px'}}>{error}</div>}
+                        {recognizedText && <textarea className="text-area" value={recognizedText} readOnly />}
+                    </div>
+                    <div className="ocr-chat-container">
+                        <div className="kb-chat-history" ref={chatHistoryRef}>
+                            {chatHistory.map((msg, index) => (
+                                <div key={index} className={`kb-message ${msg.role} ${msg.isError ? 'error' : ''}`}>
+                                    <div className="message-content" style={{padding: '8px 12px', maxWidth: '100%'}}>
+                                        <p>{msg.text}</p>
+                                    </div>
+                                </div>
+                            ))}
+                             {isChatLoading && chatHistory[chatHistory.length - 1]?.role === 'model' && !chatHistory[chatHistory.length - 1]?.text && (
+                                <div className="spinner-container" style={{padding: '10px 0'}}><div className="spinner"></div></div>
+                            )}
+                        </div>
+                        <form className="chat-input-form" onSubmit={handleSendChatMessage}>
+                            <textarea
+                                className="chat-input"
+                                value={chatInput}
+                                onChange={(e) => setChatInput(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendChatMessage(); }}}
+                                placeholder="就识别出的文本提问..."
+                                rows={1}
+                                disabled={isChatLoading || !recognizedText}
+                            />
+                            <button type="submit" className="btn btn-primary send-btn" disabled={isChatLoading || !chatInput.trim() || !recognizedText}>发送</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
 
 const App = () => {
-    type View = 'home' | 'notes' | 'audit' | 'knowledge-chat' | 'writing';
+    type View = 'home' | 'notes' | 'audit' | 'knowledge-chat' | 'writing' | 'text-recognition';
     const [view, setView] = useState<View>('home');
     const [inputText, setInputText] = useState('');
     const [noteAnalysisResult, setNoteAnalysisResult] = useState<NoteAnalysis | null>(null);
@@ -2164,6 +2774,10 @@ const App = () => {
         setView('writing');
     };
 
+    const handleTriggerTextRecognition = () => {
+        setView('text-recognition');
+    };
+
     const handleCloseThoughtsModal = () => {
         setIsThoughtsModalOpen(false);
     }
@@ -2225,6 +2839,11 @@ const App = () => {
                     knowledgeBases={knowledgeBases}
                     executionMode={executionMode}
                 />;
+            case 'text-recognition':
+                return <TextRecognitionView 
+                    provider={selectedModel}
+                    executionMode={executionMode}
+                />;
             case 'home':
             default:
                 return (
@@ -2243,6 +2862,7 @@ const App = () => {
                         setSelectedKnowledgeBase={setSelectedKnowledgeBase}
                         onKnowledgeChat={handleTriggerKnowledgeChat}
                         onWriting={handleTriggerWriting}
+                        onTextRecognition={handleTriggerTextRecognition}
                         executionMode={executionMode}
                         setExecutionMode={setExecutionMode}
                     />

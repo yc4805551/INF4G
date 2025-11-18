@@ -7,6 +7,8 @@ export default defineConfig({
   base: '/INF3/',
   plugins: [react()],
   server: {
+    host: 'www.yc01.top',
+    port: 5178,
     watch: {
       // Ignore changes to tsconfig.json to prevent unwanted server restarts
       // if an IDE or another tool modifies it.
@@ -15,9 +17,10 @@ export default defineConfig({
     proxy: {
       // Proxy for the local backend, which handles both knowledge base
       // and AI generation requests during development.
-      '/api': {
-        target: 'http://localhost:5000', // Use localhost for better compatibility.
+      '/proxy-api': {
+        target: 'http://www.yc01.top:5179', // Proxy target for the local backend service.
         changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/proxy-api/, '/api'),
         // Add logging to help debug proxy issues.
         configure: (proxy, options) => {
           proxy.on('proxyReq', (proxyReq, req, res) => {
