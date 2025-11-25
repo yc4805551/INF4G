@@ -1,13 +1,18 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactDOM from 'react-dom/client';
 import mammoth from 'mammoth';
 import { marked } from 'marked';
 import { GoogleGenAI } from '@google/genai';
 
+// Helper to clean environment variables (remove accidentally added quotes/smart-quotes)
+const cleanEnv = (value: string | undefined): string | undefined => {
+    if (!value) return undefined;
+    // Remove leading/trailing whitespace and quotes (straight or smart)
+    return value.trim().replace(/^["'“]+|["'”]+$/g, '');
+};
 
 const API_BASE_URL = import.meta.env?.PROD
-  ? `${import.meta.env.VITE_API_BASE_URL || ''}/api`
+  ? `${cleanEnv(import.meta.env.VITE_API_BASE_URL) || ''}/api`
   : '/proxy-api';//doujunhao- 设置了后端连接
 
 // FIX: Modified debounce to return a function with a `clearTimeout` method to cancel pending calls.
@@ -99,33 +104,34 @@ const frontendApiConfig: Record<string, {
     model?: string;
 }> = {
     gemini: {
-        apiKey: import.meta.env?.VITE_GEMINI_API_KEY,
+        apiKey: cleanEnv(import.meta.env?.VITE_GEMINI_API_KEY),
         model: 'gemini-2.5-flash',
     },
     openai: {
-        apiKey: import.meta.env?.VITE_OPENAI_API_KEY,
-        endpoint: import.meta.env?.VITE_OPENAI_TARGET_URL ? `${import.meta.env.VITE_OPENAI_TARGET_URL}/v1/chat/completions` : undefined,
-        model: import.meta.env?.VITE_OPENAI_MODEL,
+        apiKey: cleanEnv(import.meta.env?.VITE_OPENAI_API_KEY),
+        // Prioritize VITE_OPENAI_ENDPOINT if available, matching usage in other providers
+        endpoint: cleanEnv(import.meta.env?.VITE_OPENAI_ENDPOINT) || (cleanEnv(import.meta.env?.VITE_OPENAI_TARGET_URL) ? `${cleanEnv(import.meta.env.VITE_OPENAI_TARGET_URL)}/v1/chat/completions` : undefined),
+        model: cleanEnv(import.meta.env?.VITE_OPENAI_MODEL),
     },
     deepseek: {
-        apiKey: import.meta.env?.VITE_DEEPSEEK_API_KEY,
-        endpoint: import.meta.env?.VITE_DEEPSEEK_ENDPOINT,
-        model: import.meta.env?.VITE_DEEPSEEK_MODEL,
+        apiKey: cleanEnv(import.meta.env?.VITE_DEEPSEEK_API_KEY),
+        endpoint: cleanEnv(import.meta.env?.VITE_DEEPSEEK_ENDPOINT),
+        model: cleanEnv(import.meta.env?.VITE_DEEPSEEK_MODEL),
     },
     ali: {
-        apiKey: import.meta.env?.VITE_ALI_API_KEY,
-        endpoint: import.meta.env?.VITE_ALI_ENDPOINT || (import.meta.env?.VITE_ALI_TARGET_URL ? `${import.meta.env.VITE_ALI_TARGET_URL}/v1/chat/completions` : undefined),
-        model: import.meta.env?.VITE_ALI_MODEL,
+        apiKey: cleanEnv(import.meta.env?.VITE_ALI_API_KEY),
+        endpoint: cleanEnv(import.meta.env?.VITE_ALI_ENDPOINT) || (cleanEnv(import.meta.env?.VITE_ALI_TARGET_URL) ? `${cleanEnv(import.meta.env.VITE_ALI_TARGET_URL)}/v1/chat/completions` : undefined),
+        model: cleanEnv(import.meta.env?.VITE_ALI_MODEL),
     },
     depOCR: {
-        apiKey: import.meta.env?.VITE_DEPOCR_API_KEY,
-        endpoint: import.meta.env?.VITE_DEPOCR_ENDPOINT,
-        model: import.meta.env?.VITE_DEPOCR_MODEL,
+        apiKey: cleanEnv(import.meta.env?.VITE_DEPOCR_API_KEY),
+        endpoint: cleanEnv(import.meta.env?.VITE_DEPOCR_ENDPOINT),
+        model: cleanEnv(import.meta.env?.VITE_DEPOCR_MODEL),
     },
     doubao: {
-        apiKey: import.meta.env?.VITE_DOUBAO_API_KEY,
-        endpoint: import.meta.env?.VITE_DOUBAO_ENDPOINT,
-        model: import.meta.env?.VITE_DOUBAO_MODEL,
+        apiKey: cleanEnv(import.meta.env?.VITE_DOUBAO_API_KEY),
+        endpoint: cleanEnv(import.meta.env?.VITE_DOUBAO_ENDPOINT),
+        model: cleanEnv(import.meta.env?.VITE_DOUBAO_MODEL),
     },
 };
 
@@ -1154,13 +1160,17 @@ const parseAuditResponse = (responseText: string): { issues: AuditIssue[], error
   else if (typeof data === 'object' && data !== null && 'issues' in data && Array.isArray((data as { issues: any }).issues)) {
     issuesArray = (data as { issues: AuditIssue[] }).issues;
   }
-  // 5. 【关键修复】如果两种都不是，说明格式错误 
+  // 5. 检查是否为单个问题对象 (Handling the specific request where model returns a single object instead of array)
+  else if (typeof data === 'object' && data !== null && 'problematicText' in data && 'suggestion' in data) {
+    issuesArray = [data as AuditIssue];
+  }
+  // 6. 如果都不是，说明格式错误 
   else { 
     // 我们现在将原始的 'responseText' 作为 rawResponse 传递回去，以便调试 
-    return { issues: [], error: "模型返回了意外的 JSON 格式 (既不是数组，也不是包含 'issues' 的对象)。", rawResponse: responseText }; 
+    return { issues: [], error: "模型返回了意外的 JSON 格式 (既不是数组，也不是包含 'issues' 的对象，也不是单个问题对象)。", rawResponse: responseText }; 
   }
 
-  // 6. 现在我们安全地筛选 issuesArray 
+  // 7. 现在我们安全地筛选 issuesArray 
   const validIssues = issuesArray.filter(issue =>
     issue &&
     typeof issue.problematicText === 'string' &&
