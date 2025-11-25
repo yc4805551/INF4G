@@ -4,7 +4,7 @@ import { ServerResponse } from 'http';
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  base: '/INF3/',
+  base: './', // Use relative base path for flexible deployment (fixes "black and white" UI on GitHub Pages)
   plugins: [react()],
   server: {
     host: 'www.yc01.top',
