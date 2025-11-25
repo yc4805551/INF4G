@@ -791,13 +791,7 @@ const NoteAnalysisView = ({
 
   useEffect(() => {
     if (chatHistoryRef.current) {
-        // Use setTimeout to ensure DOM has updated before scrolling
-        const timer = setTimeout(() => {
-             if (chatHistoryRef.current) {
-                chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
-             }
-        }, 100);
-        return () => clearTimeout(timer);
+        chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
     }
   }, [chatHistory]);
 
@@ -1134,9 +1128,8 @@ const parseJsonResponse = <T,>(responseText: string): { data: T | null, error?: 
 
     if (parsedData === null) {
         const lowercasedResponse = responseText.toLowerCase();
-        // FIX: Removed invalid 'asQlT' syntax and Array.isArray check which was redundant or malformed.
-        if ((lowercasedResponse.includes('no issues found') || lowercasedResponse.includes('没有发现') || lowercasedResponse.includes('未发现'))) {
-            return { data: [] as any as T };
+        if (Array.isArray([] as T) && (lowercasedResponse.includes('no issues found') || lowercasedResponse.includes('没有发现') || lowercasedResponse.includes('未发现'))) {
+            return { data: [] as T };
         }
         return { 
             data: null, 
@@ -1149,58 +1142,43 @@ const parseJsonResponse = <T,>(responseText: string): { data: T | null, error?: 
 
 
 const parseAuditResponse = (responseText: string): { issues: AuditIssue[], error?: string, rawResponse?: string } => { 
+  // 1. 'parseError' 和 'parsedRawResponse' 仅在 parseJsonResponse 本身失败时才会被设置 
   const { data, error: parseError, rawResponse: parsedRawResponse } = parseJsonResponse<unknown>(responseText); 
 
+  // 2. 如果 parseJsonResponse 失败，则将其错误和原始响应向上传递 
   if (!data) { 
     return { issues: [], error: parseError, rawResponse: parsedRawResponse }; 
   }
 
-  let issuesArray: any[] = [];
+  let issuesArray: AuditIssue[] = [];
 
+  // 3. 检查 data 是否直接就是一个数组 
   if (Array.isArray(data)) {
-    issuesArray = data;
+    issuesArray = data as AuditIssue[];
   }
-  else if (typeof data === 'object' && data !== null) {
-    // If it's an object, check if it contains 'issues' array
-    if ('issues' in data && Array.isArray((data as any).issues)) {
-       issuesArray = (data as any).issues;
-    } else {
-       // Otherwise, assume the object itself is a single issue object
-       issuesArray = [data];
-    }
+  // 4. 否则，检查 data 是否是一个包含 'issues' 数组的对象 
+  else if (typeof data === 'object' && data !== null && 'issues' in data && Array.isArray((data as { issues: any }).issues)) {
+    issuesArray = (data as { issues: AuditIssue[] }).issues;
   }
+  // 5. 检查是否为单个问题对象 (Handling the specific request where model returns a single object instead of array)
+  else if (typeof data === 'object' && data !== null && 'problematicText' in data && 'suggestion' in data) {
+    issuesArray = [data as AuditIssue];
+  }
+  // 6. 如果都不是，说明格式错误 
   else { 
-    return { issues: [], error: "模型返回了意外的 JSON 格式 (既不是数组，也不是包含 'issues' 的对象)。", rawResponse: responseText }; 
+    // 我们现在将原始的 'responseText' 作为 rawResponse 传递回去，以便调试 
+    return { issues: [], error: "模型返回了意外的 JSON 格式 (既不是数组，也不是包含 'issues' 的对象，也不是单个问题对象)。", rawResponse: responseText }; 
   }
 
-  // Robustly map to AuditIssue, providing defaults for missing fields to prevent crashes
-  const validIssues = issuesArray
-    .map((issue: any) => {
-        if (!issue || typeof issue !== 'object') return null;
-        // Even if problematicText is missing, we try to salvage what we can or skip
-        if (!issue.problematicText || typeof issue.problematicText !== 'string') {
-            // Some models might return just a suggestion or general advice in an object
-            // If it has at least a suggestion or explanation, we can show it with a placeholder
-             if ((issue.suggestion && typeof issue.suggestion === 'string') || (issue.explanation && typeof issue.explanation === 'string')) {
-                 return {
-                    problematicText: issue.problematicText || '(未指定文本)',
-                    suggestion: typeof issue.suggestion === 'string' ? issue.suggestion : '',
-                    checklistItem: typeof issue.checklistItem === 'string' ? issue.checklistItem : '通用规则',
-                    explanation: typeof issue.explanation === 'string' ? issue.explanation : (typeof issue.reason === 'string' ? issue.reason : '无详细说明')
-                 } as AuditIssue;
-             }
-             return null;
-        }
-        
-        return {
-            problematicText: issue.problematicText,
-            suggestion: typeof issue.suggestion === 'string' ? issue.suggestion : '',
-            checklistItem: typeof issue.checklistItem === 'string' ? issue.checklistItem : '通用规则',
-            explanation: typeof issue.explanation === 'string' ? issue.explanation : (typeof issue.reason === 'string' ? issue.reason : '无详细说明')
-        } as AuditIssue;
-    })
-    .filter((issue): issue is AuditIssue => issue !== null);
-    
+  // 7. 现在我们安全地筛选 issuesArray 
+  const validIssues = issuesArray.filter(issue =>
+    issue &&
+    typeof issue.problematicText === 'string' &&
+    typeof issue.suggestion === 'string' &&
+    typeof issue.checklistItem === 'string' &&
+    typeof issue.explanation === 'string' &&
+    issue.problematicText.trim()
+  );
   return { issues: validIssues };
 };
 
@@ -1223,7 +1201,6 @@ const AuditView = ({
         '学术名词是否前后一致'
     ]);
     const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
-    // FIX: Fixed variable declaration syntax from 'constSXtextDisplayRef' to 'const textDisplayRef'.
     const textDisplayRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -1509,13 +1486,7 @@ const KnowledgeChatView = ({
   
   useEffect(() => {
     if (chatHistoryRef.current) {
-        // Use setTimeout to ensure DOM has updated before scrolling
-        const timer = setTimeout(() => {
-             if (chatHistoryRef.current) {
-                chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
-             }
-        }, 100);
-        return () => clearTimeout(timer);
+        chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
     }
   }, [chatHistory]);
   
@@ -1861,13 +1832,7 @@ const WritingView = ({
 
   useEffect(() => {
     if (chatHistoryRef.current) {
-        // Use setTimeout to ensure DOM has updated before scrolling
-        const timer = setTimeout(() => {
-             if (chatHistoryRef.current) {
-                chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
-             }
-        }, 100);
-        return () => clearTimeout(timer);
+        chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
     }
   }, [chatHistory]);
 
@@ -2363,13 +2328,7 @@ const TextRecognitionView = ({ provider, executionMode }: { provider: ModelProvi
 
     useEffect(() => {
         if (chatHistoryRef.current) {
-            // Use setTimeout to ensure DOM has updated before scrolling
-            const timer = setTimeout(() => {
-                 if (chatHistoryRef.current) {
-                    chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
-                 }
-            }, 100);
-            return () => clearTimeout(timer);
+            chatHistoryRef.current.scrollTop = chatHistoryRef.current.scrollHeight;
         }
     }, [chatHistory]);
     
